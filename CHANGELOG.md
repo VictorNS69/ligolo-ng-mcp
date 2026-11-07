@@ -4,6 +4,23 @@ Fork of [`schwarztim/sec-ligolo-ng-mcp`](https://github.com/schwarztim/sec-ligol
 (MIT). Versions below are this fork's; `1.0.0` is the upstream initial release it
 started from.
 
+## 1.3.1 — 2026-11-07
+
+### Security
+
+- Dependency refresh: `@modelcontextprotocol/sdk` 1.25.3 → 1.32.2, which brings
+  patched `express` 5.3.0, `hono` 4.13.17, `@hono/node-server` 2.1.6, `zod`
+  4.6.7, `ajv` 8.20.0, `fast-uri` 3.1.9, `qs` 6.17.1, `path-to-regexp` 8.4.2 and
+  `body-parser` 2.4.0. `npm audit` goes from **10 advisories (1 critical, 7
+  high)** to **0**. Also `@types/node` 22.20.5.
+- The upstream repository this fork came from has seven open Dependabot PRs, all
+  transitive bumps inside the old SDK range (fast-uri, hono, @hono/node-server,
+  path-to-regexp, ajv, qs, and SDK 1.25.3 → 1.26.0). Upgrading the one root
+  dependency supersedes all seven; there is nothing to cherry-pick.
+- `.github/dependabot.yml` (grouped, weekly npm / monthly actions) and a
+  `.github/workflows/test.yml` gate so the next bump arrives with a test run
+  rather than sitting unmerged.
+
 ## 1.3.0 — 2026-11-07
 
 ### Added

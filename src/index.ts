@@ -10,6 +10,10 @@
 // Reachability-changing tools (tunnel start, route add, listener add)
 // run the framework's lateral-movement hard checkpoint first and refuse
 // to touch the API when it denies. See src/ligolo.ts.
+//
+// LIGOLO_MCP_READ_ONLY=1 registers only the read-only half; every failure
+// comes back as JSON with isError, so a refused checkpoint is never
+// confused with a broken proxy.
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -31,7 +35,7 @@ import {
   AgentRecord,
   ListenerRecord,
 } from "./ligolo.js";
-import { proxyStatus, startProxy, stopProxy } from "./proxy.js";
+import { applyPortOverride, proxyStatus, startProxy, stopProxy } from "./proxy.js";
 
 const cfg: Config = loadConfig();
 const api = new LigoloApi(cfg);
@@ -184,7 +188,13 @@ const writeTools: Tool[] = [
     inputSchema: {
       type: "object" as const,
       properties: {
-        port: { type: "string", description: "Agent-facing listen port", default: "11601" },
+        port: {
+          type: "string",
+          description:
+            "Agent-facing listen port for this proxy instance, overriding LIGOLO_PROXY_ADDR's port (1-65535). " +
+            "Use it when the default 11601 is already taken or an egress rule pins a port.",
+          default: "11601",
+        },
         rewriteConfig: {
           type: "boolean",
           description: "Rewrite an existing ligolo-ng.yaml that lacks web.enabled/web.users (backup written first)",
@@ -325,6 +335,7 @@ const tools: Tool[] = cfg.readOnly ? readTools : [...readTools, ...writeTools];
 type Payload = Record<string, unknown>;
 
 async function handleProxyStart(args: Args): Promise<Payload> {
+  applyPortOverride(cfg, str(args, "port"));
   const state = await startProxy(cfg, bool(args, "rewriteConfig", false));
   log(`ligolo_proxy_start api=${state.apiUrl} binary=${state.binary ?? "<missing>"}`);
   let fingerprint: string | null = null;

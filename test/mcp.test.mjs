@@ -650,3 +650,32 @@ describe("credential seeding", () => {
     assert.equal(again.created, false);
   });
 });
+
+describe("agent-facing port override", () => {
+  it("replaces only the port of LIGOLO_PROXY_ADDR", async () => {
+    const { loadConfig } = await import("../dist/ligolo.js");
+    const { applyPortOverride } = await import("../dist/proxy.js");
+    const cfg = loadConfig({ LIGOLO_PROXY_ADDR: "192.0.2.5:11601", LIGOLO_API_LISTEN: "127.0.0.1:8080" }, process.cwd());
+    applyPortOverride(cfg, "443");
+    assert.equal(cfg.proxyAddr, "192.0.2.5:443");
+    assert.equal(cfg.apiListen, "127.0.0.1:8080", "the API listen address must not move with the agent port");
+  });
+
+  it("keeps the default when no port is passed", async () => {
+    const { loadConfig } = await import("../dist/ligolo.js");
+    const { applyPortOverride } = await import("../dist/proxy.js");
+    const cfg = loadConfig({ LIGOLO_PROXY_ADDR: "" }, process.cwd());
+    assert.equal(cfg.proxyAddr, "0.0.0.0:11601");
+    applyPortOverride(cfg, "");
+    assert.equal(cfg.proxyAddr, "0.0.0.0:11601");
+  });
+
+  it("refuses a non-numeric or out-of-range port instead of rewriting the address", async () => {
+    const { loadConfig } = await import("../dist/ligolo.js");
+    const { applyPortOverride } = await import("../dist/proxy.js");
+    const cfg = loadConfig({ LIGOLO_PROXY_ADDR: "0.0.0.0:11601" }, process.cwd());
+    assert.throws(() => applyPortOverride(cfg, "0.0.0.0:443"), /invalid port/);
+    assert.throws(() => applyPortOverride(cfg, "70000"), /invalid port/);
+    assert.equal(cfg.proxyAddr, "0.0.0.0:11601");
+  });
+});

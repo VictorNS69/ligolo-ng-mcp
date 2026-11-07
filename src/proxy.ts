@@ -13,6 +13,25 @@ import { dirname, join } from "node:path";
 
 import { Config, LigoloApi } from "./ligolo.js";
 
+/**
+ * Per-call agent-facing port override.
+ *
+ * `LIGOLO_PROXY_ADDR` is the session-wide default, but the port is the one
+ * thing that legitimately changes between pivots (an operator may already
+ * hold 11601 for another proxy, or need a port that survives a restrictive
+ * egress rule). Only the port is replaceable, and only if it is numeric —
+ * a malformed value must not silently rewrite the listen address.
+ */
+export function applyPortOverride(cfg: Config, port: string): void {
+  const trimmed = port.trim();
+  if (trimmed === "") return;
+  if (!/^\d{1,5}$/.test(trimmed) || Number(trimmed) > 65535) {
+    throw new Error(`invalid port '${port}': expected 1-65535`);
+  }
+  const host = cfg.proxyAddr.includes(":") ? cfg.proxyAddr.slice(0, cfg.proxyAddr.lastIndexOf(":")) : cfg.proxyAddr;
+  cfg.proxyAddr = `${host}:${Number(trimmed)}`;
+}
+
 export interface ProxyState {
   running: boolean;
   pid: number | null;

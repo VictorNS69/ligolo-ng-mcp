@@ -4,6 +4,29 @@ Fork of [`schwarztim/sec-ligolo-ng-mcp`](https://github.com/schwarztim/sec-ligol
 (MIT). Versions below are this fork's; `1.0.0` is the upstream initial release it
 started from.
 
+## 1.3.0 — 2026-11-07
+
+### Added
+
+- **Standalone mode.** `LIGOLO_SCOPE` (comma-separated hosts/CIDRs) authorizes
+  reachability-changing calls without any framework: target must be inside the
+  list and the call must pass `confirmed: true`. Read-only tools need nothing.
+  Previously every mutating tool refused unless a BITORIA checkout and an
+  assessment were present, which made the server unusable outside that framework.
+- The gate now has two explicit modes with stable exit codes: 3 = target outside
+  `LIGOLO_SCOPE`, 5 = checkpoint not confirmed, 4 = no authorization source /
+  assessment did not opt in.
+
+### Changed
+
+- **Framework mode requires the assessment to opt in**: `scope.yaml` must carry
+  `ligolo:
+  mcp: true`, asked at assessment setup and **off by default** (the
+  same defaulting rule as the Burp MCP block). Without it, mutating tools refuse
+  and name the console wrapper as the fallback.
+- There is no `--force`, `LIGOLO_GATE=off`, or equivalent: the gate either has an
+  authorization source or refuses.
+
 ## 1.2.0 — 2026-11-07
 
 ### Added

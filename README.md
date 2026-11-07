@@ -120,6 +120,7 @@ npm run build
 | `LIGOLO_ASSESSMENT` | — | assessment name/path for the gate; when unset, the active-assessment marker is used |
 | `LIGOLO_BITORIA_ROOT` | auto-detected | framework checkout owning `scripts/common/scope_check.py` (walks up from cwd) |
 | `LIGOLO_MCP_READ_ONLY` | off | `1` registers only the 9 read-only tools |
+| `LIGOLO_SCOPE` | — | **standalone authorization**: comma-separated hosts/CIDRs this server may pivot to when no BITORIA assessment is in play (see [Running outside BITORIA](#running-outside-bitoria)) |
 | `LIGOLO_ASSESSMENT` (effect) | — | when set/resolved, proxy logs go to `assessments/<name>/state/ligolo[<n>].log`; otherwise `<workspace>/ligolo[<n>].log` |
 
 Precedence: an explicit environment value wins; otherwise
@@ -242,13 +243,25 @@ that process put it.
 ## The lateral-movement gate
 
 `ligolo_tunnel_start`, `ligolo_route_add` and `ligolo_listener_add` make
-something newly reachable, so each runs
+something newly reachable, so each passes a gate **before** the HTTP request
+leaves the process. The gate has two modes and no off switch.
 
-```
-scripts/common/scope_check.py <target> --assessment <A> --technique lateral --checkpoint
-```
+### Framework mode (BITORIA assessment active)
 
-**before** the HTTP request leaves the process:
+Two conditions, in order:
+
+1. The assessment opted in. `scope.yaml` must contain
+
+   ```yaml
+   ligolo:
+     mcp: true
+   ```
+
+   This is asked at assessment setup and is **off by default**, the same way the
+   Burp MCP block is — an engagement that never opted in keeps using the console
+   wrapper, and the MCP tools refuse with exit 4 rather than quietly working.
+2. `scripts/common/scope_check.py <target> --assessment <A> --technique lateral --checkpoint`
+   then runs the lateral hard checkpoint exactly as a wrapper would:
 
 | Outcome | What happens |
 |---|---|
@@ -269,6 +282,27 @@ With no `LIGOLO_ASSESSMENT`, the server reads `state/assessment-scope.json` —
 the same marker (and the same 12h TTL) the framework's filesystem guard uses. An
 **expired or invalid marker counts as no assessment**: a leftover file refuses
 the pivot instead of authorizing it.
+
+### Standalone mode (no BITORIA)
+
+The server does not require a framework. Set `LIGOLO_SCOPE` to the hosts/CIDRs
+you are authorized to reach:
+
+```bash
+export LIGOLO_SCOPE="10.10.10.0/24,172.16.5.9"
+```
+
+A reachability-changing call then needs a target inside that list **and**
+`confirmed: true`. Out-of-scope → exit 3, missing confirmation → exit 5. IPv4
+ranges are bit-compared; anything else is matched exactly.
+
+### Neither configured
+
+Mutating tools refuse with exit 4 and name both options; read-only tools
+(`agents_list`, `interface_list`, `route_list`, `listener_list`, fingerprints,
+`proxy_status`) keep working. There is deliberately no `--force`,
+`LIGOLO_GATE=off`, or "trust me" flag: a gate that can be switched off is not a
+gate.
 
 ## Tools
 
@@ -353,11 +387,33 @@ Versus upstream 1.0.0:
 - `ligolo_agent_command` pins the fingerprint and no longer defaults to
   `-ignore-cert`; `debugIgnoreCert: true` restores the old behaviour with a warning.
 - Errors are JSON (`isError: true`) instead of English prose.
+- 1.3.0: framework mode now also requires `ligolo.mcp: true` in the
+  assessment's `scope.yaml` (**off by default**); standalone use is supported via
+  `LIGOLO_SCOPE` (previously mutating tools refused without a framework at all).
 - 1.2.0: proxy logs moved from `<workspace>/ligolo-proxy.log` to
   `<assessment>/state/ligolo.log` + the per-instance numbering above; every tool
   gained the optional `instance` argument; `ligolo_proxy_start` gained `apiPort`
   and `ligolo_proxy_status` returns a list instead of a single state when called
   with no `instance`.
+
+## Running outside BITORIA
+
+Everything except the framework-mode flag works without a framework checkout:
+proxy lifecycle, agent/interface/route/listener state, fingerprints, teardown,
+and the checkpoint via `LIGOLO_SCOPE`. What you lose is the assessment's
+`scope.yaml` enforcement, `state/decisions.md`, the `commands.log` audit trail
+and the state-dir log placement (logs fall back to `<workspace>/ligolo[<n>].log`).
+
+Minimum viable standalone setup:
+
+```bash
+export LIGOLO_NG_DIR=/opt/ligolo-ng          # release binaries
+export LIGOLO_PROXY_CONFIG=$HOME/.ligolo/ligolo-ng.yaml   # workspace
+export LIGOLO_SCOPE="10.10.10.0/24"          # what you may pivot to
+node dist/index.js                           # or register it in any MCP client
+```
+
+Nothing else is required — no Python, no assessment folder, no shell wrappers.
 
 ## Troubleshooting
 
@@ -366,7 +422,9 @@ Versus upstream 1.0.0:
 | `proxy binary not found` | set `LIGOLO_NG_DIR` to the release dir (holding `proxy`) or `LIGOLO_PROXY_BIN` |
 | `HTTP 401 (proxy API rejects the token — check LIGOLO_USER/LIGOLO_PASSWORD)` | wrong credentials, or a `Bearer ` prefix was hand-rolled into the header; the proxy wants the raw JWT |
 | `no active assessment (…) — mutating ligolo calls are refused` | set `LIGOLO_ASSESSMENT`, or run `pentest assessment activate <name>`; an expired marker does **not** authorize |
-| `checkpoint-denied … exit 5` | the checkpoint is real: record the pivot in `state/decisions.md`, get approval, re-call with `target` + `confirmed: true` |
+| `checkpoint-denied … exit 5` | the checkpoint is real: record the pivot in `state/decisions.md`, get approval, re-call with `target` + `confirmed: true` (standalone: same thing, the `LIGOLO_SCOPE` entry is the record) |
+| `checkpoint-denied … exit 4` "not enabled for assessment" | add `ligolo:\n  mcp: true` to the assessment's `scope.yaml` (off by default), or use the console wrapper |
+| `checkpoint-denied … exit 3` "not inside LIGOLO_SCOPE" | the target is outside the standalone authorization list; extend `LIGOLO_SCOPE` deliberately |
 | `agent N not connected (known ids: …)` | the agent died or reconnected with a new id; re-run `ligolo_agents_list` (agents reconnect with `-reconnect`, default on) |
 | `POST /api/v1/routes -> HTTP 500: interface ligolo not found` | register the interface first (`ligolo_interface_create`, or just `ligolo_tunnel_start`, which does it) |
 | `DELETE /api/v1/routes -> HTTP 500: no such process` | the tunnel was stopped before its routes; teardown now deletes routes first and treats an already-gone route as success |

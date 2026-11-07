@@ -11,7 +11,10 @@ Nothing here grants authorization, and the gate exists precisely because
 - `ligolo_tunnel_start`, `ligolo_route_add` and `ligolo_listener_add` refuse to
   run unless `scope_check.py` clears a lateral-movement checkpoint for the named
   target.
-- With no active assessment, mutating tools fail closed rather than guessing.
+- With no authorization source at all, mutating tools fail closed rather than
+  guessing; `LIGOLO_SCOPE` provides the same guarantee without a framework
+  (target-in-list plus explicit confirmation), and framework mode additionally
+  requires the assessment's `ligolo.mcp: true` opt-in.
 - `LIGOLO_MCP_READ_ONLY=1` exposes only the 9 read-only tools.
 
 ## Threat model
@@ -41,7 +44,8 @@ Nothing here grants authorization, and the gate exists precisely because
 
 | Version | Supported |
 |---|---|
-| 1.2.x | yes |
+| 1.3.x | yes |
+| 1.2.x | security fixes only |
 | 1.1.x | security fixes only |
 | 1.0.x (upstream scaffold) | no — its tools could not move a packet |
 

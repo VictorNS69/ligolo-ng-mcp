@@ -15,7 +15,7 @@ server](#register-the-server) · [Walkthrough: one pivot](#walkthrough-one-pivot
 [Agent-localhost services](#agent-localhost-services) · [Double pivot](#double-pivot) ·
 [Read-only mode](#read-only-mode) · [Logs and multiple
 instances](#logs-and-multiple-instances) · [Teardown and cleanup](#teardown-and-cleanup) ·
-[Running without the gate](#running-without-the-gate) ·
+[Running outside BITORIA](#running-outside-bitoria) ·
 [Reading the responses](#reading-the-responses) · [Raw API by hand](#raw-api-by-hand)
 
 ## Before the first call
@@ -367,23 +367,48 @@ What teardown does **not** do, and you must:
   interface is left behind. The log file stays in `state/` as evidence; do not
   delete it at teardown.
 
-## Running without the gate
+## Running outside BITORIA
 
-Three reachability-changing tools refuse to run unless
-`scripts/common/scope_check.py` clears a lateral checkpoint for the target. That
-is not configurable from this side: there is no "skip" flag, no env var, no
-read-write-without-assessment mode. Without a framework checkout you get:
+The server does not require the framework, and this is a supported mode, not a
+degraded one — proxy lifecycle, agents, interfaces, routes, listeners,
+fingerprints and teardown all work. One env var carries the authorization:
 
-- the 9 read-only tools, fully functional;
-- `checkpoint-denied` with `exit_code: 4` and a message naming what is missing
-  (`no active assessment`, or `framework root not found`).
+```bash
+export LIGOLO_SCOPE="10.10.10.0/24,172.16.5.9"   # hosts/CIDRs you may pivot to
+```
 
-If you are using this outside a governed assessment, either point
-`LIGOLO_BITORIA_ROOT` at a checkout (the gate is cheap when you have one), or
-drive the proxy's HTTP API directly — README §HTTP endpoints used is the exact
-surface the tools call. Choosing that second path means choosing to own the
-authorization decision yourself; the server will not pretend to gate what it is
-not gating.
+`ligolo_tunnel_start` / `ligolo_route_add` / `ligolo_listener_add` then require
+the target to be inside that list **and** `confirmed: true`:
+
+```
+target inside LIGOLO_SCOPE, no confirmed   → checkpoint-denied, exit 5
+target outside LIGOLO_SCOPE                → checkpoint-denied, exit 3
+neither LIGOLO_SCOPE nor an assessment     → checkpoint-denied, exit 4
+```
+
+What standalone mode does not give you: the assessment's `scope.yaml`
+enforcement beyond `LIGOLO_SCOPE`, `state/decisions.md`, the `commands.log`
+audit trail, and state-dir logs (they fall back to `<workspace>/ligolo[<n>].log`).
+If you run assessments for real, use framework mode; `LIGOLO_SCOPE` is for
+labs, CTFs, and one-off pivots.
+
+There is no way to turn the gate off. If you find yourself wanting to, the
+honest move is to write the target into `LIGOLO_SCOPE` and confirm — that
+leaves a record of what you decided was authorized.
+
+### Framework mode needs the assessment's opt-in
+
+When a BITORIA assessment is active, `scope.yaml` must say
+
+```yaml
+ligolo:
+  mcp: true
+```
+
+It is asked at assessment setup and is **off by default**, like the Burp MCP
+block. Without it the mutating tools refuse (exit 4) — the console wrapper
+(`scripts/pivoting/ligolo_console.sh`) is the path for an engagement that did not
+opt in. Read-only tools never need it.
 
 ## Reading the responses
 

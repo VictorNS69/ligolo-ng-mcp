@@ -1,13 +1,14 @@
 {
   "name": "ligolo-ng-mcp",
-  "version": "1.0.0",
-  "description": "MCP server for ligolo-ng tunneling/pivoting tool",
+  "version": "1.1.0",
+  "description": "MCP server for ligolo-ng \u2014 pivoting over the proxy's authenticated REST control plane, gated by the BITORIA lateral-movement checkpoint",
   "main": "dist/index.js",
   "type": "module",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "test": "npm run build && node --test test/"
   },
   "keywords": [
     "mcp",
@@ -16,7 +17,7 @@
     "pivoting",
     "pentest"
   ],
-  "author": "thesun",
+  "author": "V\u00edctor Nieves",
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0"
@@ -24,5 +25,13 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "typescript": "^5.7.0"
-  }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ]
 }

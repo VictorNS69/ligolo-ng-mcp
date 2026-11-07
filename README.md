@@ -1,205 +1,193 @@
-# Ligolo-ng MCP Server
+# Ligolo-ng MCP server
 
-A Model Context Protocol (MCP) server for managing [Ligolo-ng](https://github.com/nicocha30/ligolo-ng) - a lightweight and fast tunneling tool for establishing reverse TCP/TLS tunnels during penetration testing and red team engagements.
+A [Model Context Protocol](https://modelcontextprotocol.io) server for
+[ligolo-ng](https://github.com/nicocha30/ligolo-ng) — pivoting and lateral
+movement in authorized security assessments.
 
-## Overview
+Every tool is a call against the ligolo **proxy's authenticated REST control
+plane**. No SSH, no tmux, no scraping the readline console.
 
-This MCP server enables AI assistants to control Ligolo-ng operations on a remote Kali Linux machine via SSH. It provides tools for managing the proxy server, agents, tunnels, routes, and listeners - all the core functionality needed for network pivoting during security assessments.
+```
+MCP client ──stdio──> ligolo-ng-mcp ──HTTP /api/v1──> ligolo proxy ──TLS──> agent
+                                              │
+                                              └─ scope_check.py (lateral checkpoint)
+                                              └─ log_command.sh (audit trail)
+```
 
-## Features
+## Why this fork
 
-- **Proxy Management**: Start, stop, and monitor the Ligolo-ng proxy server
-- **Agent Control**: List connected agents and manage sessions
-- **Network Interface**: Create and manage TUN interfaces for tunneling
-- **Tunnel Operations**: Start/stop tunnels through agent sessions
-- **Route Management**: Add and remove routes to target networks
-- **Listener Configuration**: Set up port forwarding through agents
-- **Agent Command Generation**: Generate agent connection commands for targets
+The upstream repository this fork started from (schwarztim/sec-ligolo-ng-mcp) declared
+19 tools and implemented three log greps. Measured against proxy 0.9.1:
 
-## Prerequisites
+| Tool | Original behaviour |
+|---|---|
+| `ligolo_proxy_start` | `ssh kali "nohup ligolo-proxy …"` — wrong binary name (upstream ships `proxy`) |
+| `ligolo_session_select` | returned the prose "Session selection requires interactive access" |
+| `ligolo_tunnel_start` / `_stop` | returned "run in the ligolo-ng console: tunnel_start" |
+| `ligolo_listener_add` / `_list` / `_delete` | returned the command for a human to type |
+| `ligolo_agent_info` | told the caller to run `ifconfig` |
+| `ligolo_send_command` | suggested `screen -r` |
+| `ligolo_agents_list` | `grep` over `/tmp/ligolo-proxy.log` |
 
-- Node.js 18+
-- SSH access to a Kali Linux machine with Ligolo-ng installed
-- SSH key-based authentication configured (passwordless SSH)
+The architecture could not work even after fixing typos: the proxy console is a
+readline TUI, its `session`/`autoroute` steps are interactive overlays, and each
+tool call was a fresh `ssh` process, so console state was lost between calls.
 
-## Installation
+The tool *surface* was sound, though, so this fork keeps all 19 names and
+replaces the internals: the proxy has shipped an authenticated REST API since
+v0.8 (`POST /api/auth` → JWT, then `/api/v1/…`) that expresses the same
+operations without a terminal. Two tools changed meaning, and two gained
+required parameters — see [Breaking changes](#breaking-changes).
+
+## Requirements
+
+- Node.js 20+
+- a ligolo-ng release (proxy **and** agent) — this fork is tested against
+  **proxy 0.9.1/0.9.2**. Nothing is vendored: point `LIGOLO_NG_DIR` at the
+  directory holding `proxy`, or set `LIGOLO_PROXY_BIN`.
+- privileges to create a TUN interface for the proxy (the agent needs none)
+- to use the checkpoint gate: a BITORIA checkout (`scripts/common/scope_check.py`)
+
+## Install
 
 ```bash
-# Clone the repository
-git clone https://github.com/schwarztim/sec-ligolo-ng-mcp.git
-cd sec-ligolo-ng-mcp
-
-# Install dependencies
+git clone git@github.com:VictorNS69/ligolo-ng-mcp.git
+cd ligolo-ng-mcp
 npm install
-
-# Build the project
 npm run build
 ```
 
 ## Configuration
 
-### Environment Variables
+| Variable | Default | Meaning |
+|---|---|---|
+| `LIGOLO_NG_DIR` | — | directory holding `proxy` / `agent` (`…/linux/proxy` also probed) |
+| `LIGOLO_PROXY_BIN` | — | explicit path to the proxy binary |
+| `LIGOLO_API` | `http://127.0.0.1:8080` | proxy REST API base URL |
+| `LIGOLO_USER` | `ligolo` | API user (proxy config `web.users`) |
+| `LIGOLO_PASSWORD` | — | API password; if unset, `ligolo_proxy_start` generates one |
+| `LIGOLO_TOKEN` | — | pre-minted JWT instead of user/password |
+| `LIGOLO_INTERFACE` | `ligolo` | default TUN interface name |
+| `LIGOLO_PROXY_ADDR` | `0.0.0.0:11601` | agent-facing listen address |
+| `LIGOLO_API_LISTEN` | `127.0.0.1:8080` | API listen address written into a seeded config |
+| `LIGOLO_PROXY_CONFIG` | `./ligolo-ng.yaml` | proxy config; keep it in a workspace, not a repo root |
+| `LIGOLO_SELFCERT_DIR` / `LIGOLO_SELFCERT_DOMAIN` | `./ligolo-selfcerts` / `ligolo` | where `-selfcert` caches its cert (fingerprint source) |
+| `LIGOLO_ASSESSMENT` | — | assessment name/path for the gate; falls back to `state/assessment-scope.json` |
+| `LIGOLO_BITORIA_ROOT` | auto-detected | framework checkout owning `scripts/common/scope_check.py` |
+| `LIGOLO_MCP_READ_ONLY` | off | `1` registers only the 9 read-only tools |
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `KALI_HOST` | `kali` | SSH hostname or alias for your Kali machine |
-| `LIGOLO_PROXY_PORT` | `11601` | Port for agent connections |
-| `LIGOLO_API_PORT` | `8080` | Port for the Ligolo-ng web API |
-| `LIGOLO_INTERFACE` | `ligolo` | Default TUN interface name |
+Generated credentials land in `.ligolo-mcp-credentials` (mode 0600) next to the
+proxy config, so registering the server never needs a secret in its config.
 
-### SSH Configuration
-
-Ensure your SSH config (`~/.ssh/config`) has an entry for your Kali machine:
-
-```
-Host kali
-    HostName 192.168.1.100
-    User root
-    IdentityFile ~/.ssh/id_rsa
-```
-
-### Claude Desktop Integration
-
-Add to your `claude_desktop_config.json`:
+### Registering it
 
 ```json
 {
   "mcpServers": {
-    "ligolo-ng": {
+    "ligolo": {
       "command": "node",
-      "args": ["/path/to/sec-ligolo-ng-mcp/dist/index.js"],
+      "args": ["/path/to/ligolo-ng-mcp/dist/index.js"],
       "env": {
-        "KALI_HOST": "kali",
-        "LIGOLO_PROXY_PORT": "11601"
+        "LIGOLO_NG_DIR": "/opt/ligolo-ng",
+        "LIGOLO_API": "http://127.0.0.1:8080",
+        "LIGOLO_PROXY_CONFIG": "/path/to/workspace/ligolo-ng.yaml"
       }
     }
   }
 }
 ```
 
-## Available Tools
+## The lateral-movement gate
 
-### Proxy Management
+`ligolo_tunnel_start`, `ligolo_route_add` and `ligolo_listener_add` make
+something newly reachable, so each one runs
+`scripts/common/scope_check.py <target> --assessment <A> --technique lateral --checkpoint`
+**before** the HTTP request leaves the process:
 
-| Tool | Description |
-|------|-------------|
-| `ligolo_proxy_start` | Start the Ligolo-ng proxy server with optional self-signed certs and API |
-| `ligolo_proxy_stop` | Stop the running proxy server |
-| `ligolo_proxy_status` | Check proxy status and view recent logs |
+- exit 0 → the call proceeds, and is appended to `<assessment>/logs/commands.log`
+- exit 5 → returns `{"error": "checkpoint-denied", "action_taken": false}` and
+  nothing is sent to the proxy. Record the pivot in `state/decisions.md`, get
+  human approval, then re-call with `target` + `confirmed: true`
 
-### Session Management
+`target` is the in-scope host the action makes reachable. For a route wider than
+`/32` it is required explicitly — "visible in `ifconfig`" is not authorization.
 
-| Tool | Description |
-|------|-------------|
-| `ligolo_agents_list` | List all connected agents |
-| `ligolo_session_select` | Select an agent session to work with |
-| `ligolo_agent_info` | Get network information from the selected agent |
+Cleanup tools (`*_delete`, `ligolo_teardown`, `ligolo_tunnel_stop`) are logged
+but not checkpointed: reversing a pivot is not a new reachability transition.
 
-### Network Configuration
+## Tools
 
-| Tool | Description |
-|------|-------------|
-| `ligolo_interface_create` | Create a TUN interface for tunneling |
-| `ligolo_interface_list` | List all TUN interfaces |
-| `ligolo_tunnel_start` | Start a tunnel through the selected session |
-| `ligolo_tunnel_stop` | Stop the active tunnel |
+Read-only (always registered):
 
-### Routing
+| Tool | What it does |
+|---|---|
+| `ligolo_proxy_status` | API liveness (`/ping`), pid, binary, config and log paths |
+| `ligolo_agents_list` | agents with name, session id, tunnel state, and full NIC/address list |
+| `ligolo_session_select` | resolve one agent id (compatibility name; there is no persistent selection) |
+| `ligolo_agent_info` | one agent's interfaces (or all, if no id given) — replaces `ifconfig` |
+| `ligolo_interface_list` | TUN interfaces with routed destinations and active state |
+| `ligolo_route_list` | flattened routes per interface |
+| `ligolo_listener_list` | listeners: agent, listen addr, redirect addr, network, online |
+| `ligolo_certificate_fingerprint` | SHA-256 of the cached selfcert, in `-accept-fingerprint` form |
+| `ligolo_agent_command` | agent command line, fingerprint-pinned by default |
 
-| Tool | Description |
-|------|-------------|
-| `ligolo_route_add` | Add a route to access target networks |
-| `ligolo_route_delete` | Remove a route |
-| `ligolo_route_list` | List all Ligolo routes |
+Mutating (hidden with `LIGOLO_MCP_READ_ONLY=1`):
 
-### Port Forwarding
+| Tool | Gate |
+|---|---|
+| `ligolo_proxy_start` | starts the proxy headless with a seeded loopback-API config |
+| `ligolo_proxy_stop` | SIGTERM via pid file |
+| `ligolo_interface_create` | none (local TUN only) |
+| `ligolo_tunnel_start` | **lateral checkpoint** — creates the interface first if unregistered |
+| `ligolo_tunnel_stop` | none (cleanup) |
+| `ligolo_route_add` | **lateral checkpoint** |
+| `ligolo_route_delete` | none (cleanup) |
+| `ligolo_listener_add` | **lateral checkpoint** — also a resident artifact, log it in `cleanup-pending.md` |
+| `ligolo_listener_delete` | none (cleanup) |
+| `ligolo_teardown` | none (cleanup) — listeners → routes → tunnel → interface |
 
-| Tool | Description |
-|------|-------------|
-| `ligolo_listener_add` | Add a listener for reverse connections |
-| `ligolo_listener_list` | List active listeners |
-| `ligolo_listener_delete` | Remove a listener |
+## Breaking changes
 
-### Utilities
+- `ligolo_send_command` is **removed**. It existed to type into the console;
+  against the API there is nothing to send. `ligolo_teardown` replaces it.
+- `ligolo_session_select` no longer selects anything. It resolves an agent id
+  and returns its record; every other tool takes `agentId` explicitly.
+- `ligolo_tunnel_start` now requires `agentId`; `ligolo_tunnel_stop`,
+  `ligolo_listener_add` and `ligolo_listener_delete` gained `agentId`.
+- `ligolo_listener_add` gained `network` (default `tcp`) — the proxy rejects the
+  request without it (`{"error":"input error"}`).
+- `ligolo_route_add` requires `target` for anything wider than `/32`.
+- Reachability-changing tools return `{"error":"checkpoint-denied"}` when no
+  assessment is active. That is intentional, not a misconfiguration.
+- `ligolo_agent_command` pins the fingerprint and no longer defaults to
+  `-ignore-cert`; `debugIgnoreCert: true` restores the old behaviour with a warning.
 
-| Tool | Description |
-|------|-------------|
-| `ligolo_agent_command` | Generate agent command for target deployment |
-| `ligolo_certificate_fingerprint` | Get certificate fingerprint for secure connections |
-| `ligolo_send_command` | Send raw commands to the proxy console |
-
-## Usage Example
-
-### Basic Pivoting Workflow
-
-1. **Start the proxy on Kali**:
-   ```
-   Use ligolo_proxy_start with selfcert enabled
-   ```
-
-2. **Generate agent command**:
-   ```
-   Use ligolo_agent_command with your Kali IP
-   ```
-
-3. **Create TUN interface**:
-   ```
-   Use ligolo_interface_create
-   ```
-
-4. **After agent connects, add routes**:
-   ```
-   Use ligolo_route_add with network 10.10.10.0/24
-   ```
-
-5. **Start the tunnel**:
-   ```
-   Use ligolo_tunnel_start
-   ```
-
-Now you can access the 10.10.10.0/24 network through your Kali machine.
-
-### Setting Up Reverse Shell Callback
-
-Use listeners to receive reverse shells through the pivot:
-
-```
-Use ligolo_listener_add with:
-  localAddress: 0.0.0.0:4444
-  remoteAddress: 127.0.0.1:4444
-```
-
-This forwards connections from port 4444 on the agent back to your Kali's port 4444.
-
-## Security Considerations
-
-- This tool is designed for authorized security testing only
-- Always use certificate verification in production environments
-- The proxy runs with elevated privileges to manage network interfaces
-- SSH keys should be properly secured and not shared
-
-## Development
+## Testing
 
 ```bash
-# Watch mode for development
-npm run dev
-
-# Build
-npm run build
-
-# Start the server
-npm start
+npm test          # 19 tests: gate, teardown ordering, payload shapes, pinning
 ```
+
+The suite drives the built server over real MCP stdio against a stub proxy API,
+so it needs no ligolo binary and no root. A live smoke test against a real proxy
+plus a local agent is worth running before an engagement:
+
+1. `ligolo_proxy_start` → note `fingerprint`
+2. run the agent on the foothold with `-connect <operator>:11601 -accept-fingerprint <fp>`
+3. `ligolo_agents_list` → `ligolo_tunnel_start` (`target`, `confirmed`) → `ligolo_route_add`
+4. scan through the TUN, then `ligolo_teardown` and delete the agent binary
+
+## Security notes
+
+- The API is a control plane for offensive tooling: bind it to loopback and
+  keep `web.secret`/`web.users` in the proxy config, not in shell history.
+- The proxy reads `Authorization` **raw**; a `Bearer ` prefix returns 401.
+- `-ignore-cert` is debug-only. The fingerprint comes from the proxy's own
+  cached selfcert, so no console round-trip is needed to pin it.
+- Nothing here uploads, deletes, or cleans up the agent binary on a client
+  host — that stays an explicit step, logged at upload time.
 
 ## License
 
-MIT License - See [LICENSE](LICENSE) for details.
-
-## Acknowledgments
-
-- [Ligolo-ng](https://github.com/nicocha30/ligolo-ng) by Nicolas Chatelain
-- [Model Context Protocol](https://modelcontextprotocol.io) by Anthropic
-
-## Disclaimer
-
-This tool is intended for authorized security testing and educational purposes only. Users are responsible for ensuring they have proper authorization before using this tool against any systems. The authors are not responsible for any misuse or damage caused by this tool.
+MIT. Original work © 2025 schwarztim; fork © 2026 Víctor Nieves.
+Authorized testing only.

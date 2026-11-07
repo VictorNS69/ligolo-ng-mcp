@@ -7,6 +7,12 @@ movement in authorized security assessments.
 Every tool is a call against the ligolo **proxy's authenticated REST control
 plane**. No SSH, no tmux, no scraping the readline console.
 
+When an engagement enables this server (`ligolo.mcp: true` in a BITORIA
+`scope.yaml`, or `LIGOLO_SCOPE` standalone), **these tools are the primary pivot
+path** — the console wrapper and SOCKS fallbacks (chisel) are what you use when
+this server is disabled or cannot run. The gate enforces the enablement, so
+"enabled" is a real state rather than a convention.
+
 ```
 MCP client ──stdio──> ligolo-ng-mcp ──HTTP /api/v1──> ligolo proxy ──TLS──> agent
                             │

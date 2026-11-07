@@ -573,6 +573,7 @@ describe("proxy lifecycle", () => {
       const { isError, payload } = await h.client.call("ligolo_proxy_status");
       assert.equal(isError, false);
       assert.equal(payload.running, true);
+      assert.match(payload.compatibility, /ligolo-ng proxy 0\.9\.x \(tested 0\.9\.1, 0\.9\.2\)/);
       assert.equal(payload.apiUrl, process.env.LIGOLO_API ?? payload.apiUrl);
       assert.ok(existsSync(dirname(payload.configPath)));
     } finally {

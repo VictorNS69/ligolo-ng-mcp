@@ -525,7 +525,14 @@ async function handleToolCall(name: string, args: Args): Promise<Payload> {
       return { ...state, scope_checked: false };
     }
     case "ligolo_proxy_status":
-      return { ...(await proxyStatus(cfg)), scope_checked: false };
+      return {
+        ...(await proxyStatus(cfg)),
+        scope_checked: false,
+        // Surfaced in-band because the doc warning is not read mid-run: if the
+        // proxy answers /ping but a later call 404s, this is the first place to
+        // look — the tested range is a claim about a specific release pair.
+        compatibility: "requires ligolo-ng proxy 0.9.x (tested 0.9.1, 0.9.2); the proxy API is experimental upstream",
+      };
     case "ligolo_agents_list":
       return handleAgents();
     case "ligolo_session_select": {

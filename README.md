@@ -14,6 +14,31 @@ MCP client ──stdio──> ligolo-ng-mcp ──HTTP /api/v1──> ligolo pro
                             └─ scripts/common/log_command.sh  (audit trail per call)
 ```
 
+> [!WARNING]
+> **Version compatibility — read before upgrading ligolo-ng.**
+> This server is tested against **ligolo-ng proxy 0.9.1 and 0.9.2** (Linux
+> amd64 release binaries, with the matching agent). It depends on the proxy's
+> REST API, which upstream itself labels **experimental**: a newer ligolo-ng
+> release can rename or remove an endpoint, change a payload field, or alter
+> auth without any compatibility promise — and that breaks these tools, not
+> ligolo itself.
+>
+> - **Pin the ligolo-ng release** per engagement (keep the 0.9.x `proxy` and
+>   `agent` from the same release together). A new proxy with an old agent, or
+>   a new proxy under this MCP, is untested.
+> - **Check before blaming the MCP:** `proxy -version` should print
+>   `Ligolo-ng 0.9.x`. `npm test` is a stub-API suite — it validates this
+>   server, **not** upstream drift, so a green run does not prove a new proxy
+>   still works.
+> - **Symptoms of upstream drift:** `ligolo_proxy_status` reports the proxy
+>   running but `/api/v1/ping` fails; `404 page not found` on `/api/v1/…`;
+>   `401` for credentials that work in the WebUI; `{"error":"input error"}` on
+>   listener creation; `interface … not found` for an interface the UI shows.
+> - **If it drifted:** the endpoints and payloads this server assumes are
+>   listed in [HTTP endpoints used](#http-endpoints-used); the client methods
+>   live in `src/ligolo.ts`. Fix there, add a test, then run the live smoke
+>   test — that is the only check that exercises a real proxy.
+
 Contents: [Why this fork](#why-this-fork) · [Requirements](#requirements) ·
 [Install](#install) · [Configuration](#configuration) · [Typical
 flow](#typical-flow) · [The lateral-movement gate](#the-lateral-movement-gate) ·
@@ -55,9 +80,9 @@ the full list is in [Breaking changes](#breaking-changes). See
 ## Requirements
 
 - Node.js 20+ (`fetch`, `AbortSignal.timeout`, `X509Certificate.fingerprint256`)
-- a ligolo-ng release (proxy **and** agent) — tested against **proxy
-  0.9.1/0.9.2**. Nothing is vendored: point `LIGOLO_NG_DIR` at the directory
-  holding `proxy`, or set `LIGOLO_PROXY_BIN`.
+- a ligolo-ng release (proxy **and** agent) — see the compatibility warning
+  above; tested against proxy 0.9.1/0.9.2 only. Nothing is vendored: point
+  `LIGOLO_NG_DIR` at the directory holding `proxy`, or set `LIGOLO_PROXY_BIN`.
 - privileges to create a TUN interface for the proxy (the agent needs none —
   it uses a userland gVisor stack)
 - to use the checkpoint gate: a framework checkout providing

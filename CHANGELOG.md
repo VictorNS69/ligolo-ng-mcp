@@ -6,6 +6,11 @@ started from.
 
 ## 1.1.0 — 2026-11-07
 
+**Compatibility:** requires ligolo-ng proxy **0.9.x** (tested 0.9.1 and 0.9.2,
+with the matching agent). The proxy's REST API is labelled experimental
+upstream, so an upgrade may break these tools — see the warning at the top of
+the README before bumping ligolo-ng.
+
 Everything is now a call against the ligolo proxy's authenticated REST control
 plane (`POST /api/auth` → JWT, then `/api/v1/…`). All 19 tool names are kept;
 the internals are rewritten.

@@ -733,7 +733,7 @@ async function handleToolCall(name: string, args: Args): Promise<Payload> {
 }
 
 async function main(): Promise<void> {
-  const server = new Server({ name: "ligolo-ng-mcp", version: "1.2.0" }, { capabilities: { tools: {} } });
+  const server = new Server({ name: "ligolo-ng-mcp", version: "1.3.0" }, { capabilities: { tools: {} } });
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
 
@@ -770,7 +770,7 @@ async function main(): Promise<void> {
   await server.connect(new StdioServerTransport());
   // stdout is the MCP stream; diagnostics go to stderr only.
   console.error(
-    `ligolo-ng-mcp 1.2.0 ready — api=${cfg.apiUrl} ` +
+    `ligolo-ng-mcp 1.3.0 ready — api=${cfg.apiUrl} ` +
       `assessment=${cfg.assessment || "<unset>"}(${cfg.assessmentSource}) ` +
       `read_only=${cfg.readOnly} tools=${tools.length} framework=${cfg.bitoriaRoot ?? "<not found>"} ` +
       `logs=${cfg.assessment === "" ? "<workspace>/ligolo[<n>].log" : `assessments/${cfg.assessment}/state/ligolo[<n>].log`}`,

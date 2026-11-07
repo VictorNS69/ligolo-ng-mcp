@@ -25,7 +25,7 @@
 import { spawnSync } from "node:child_process";
 import { X509Certificate } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 export interface Config {
   /** Proxy REST API base URL, e.g. http://127.0.0.1:8080 */
@@ -57,6 +57,12 @@ export interface Config {
   bitoriaRoot: string | null;
   /** When true, mutating tools are not registered at all. */
   readOnly: boolean;
+  /**
+   * Standalone authorization: hosts/CIDRs this server may pivot to when no
+   * BITORIA assessment is in play. Empty means "no standalone authorization",
+   * which makes mutating tools refuse — the server still works read-only.
+   */
+  standaloneScope: string[];
 }
 
 function envStr(env: NodeJS.ProcessEnv, key: string, fallback: string): string {
@@ -184,6 +190,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, cwd: string = p
     credsPath,
     bitoriaRoot: root,
     readOnly: /^(1|true|yes|on)$/i.test(envStr(env, "LIGOLO_MCP_READ_ONLY", "")),
+    standaloneScope: envStr(env, "LIGOLO_SCOPE", "")
+      .split(",")
+      .map((v) => v.trim())
+      .filter((v) => v !== ""),
   };
 }
 
@@ -202,40 +212,144 @@ export class GateError extends Error {
  * denial here is information ("record the pivot in state/decisions.md
  * and re-call with confirmed: true"), not a bug to retry blindly.
  */
-export function assertScope(cfg: Config, target: string, confirmed: boolean): void {
-  if (cfg.assessment === "") {
-    throw new GateError(
-      `no active assessment (${cfg.assessmentSource}: ${cfg.assessmentDetail}) — mutating ligolo calls are ` +
-        "refused without one, because scope_check.py needs the engagement's scope.yaml. " +
-        "Set LIGOLO_ASSESSMENT=<name-or-path>, or activate the assessment " +
-        "(pentest assessment activate <name>) so state/assessment-scope.json names it.",
-      4,
-    );
+/**
+ * True/false when the assessment's scope.yaml declares `ligolo.mcp`, null when
+ * the file exists but says nothing about it. Bit-for-bit the same defaulting
+ * rule the assessment interview uses: absent means **off**.
+ */
+export function assessmentMcpFlag(cfg: Config): boolean | null {
+  if (cfg.assessment === "" || cfg.bitoriaRoot === null) return null;
+  const dir = cfg.assessment.includes("/") || isAbsolute(cfg.assessment)
+    ? resolve(cfg.assessment)
+    : join(cfg.bitoriaRoot, "assessments", cfg.assessment);
+  const file = join(dir, "scope.yaml");
+  if (!existsSync(file)) return null;
+  const lines = readFileSync(file, "utf8").split(/\r?\n/);
+  let inLigolo = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed === "" || trimmed.startsWith("#")) continue;
+    const indent = line.length - line.trimStart().length;
+    if (indent === 0) {
+      inLigolo = /^ligolo:\s*$/i.test(trimmed);
+      continue;
+    }
+    if (!inLigolo) continue;
+    const match = /^mcp:\s*(true|false)\b/i.exec(trimmed);
+    if (match) return match[1].toLowerCase() === "true";
   }
-  if (cfg.bitoriaRoot === null) {
-    throw new GateError(
-      "framework root not found (no scripts/common/scope_check.py above the working directory). " +
-        "Set LIGOLO_BITORIA_ROOT=/path/to/BITORIA-Hermes.",
-      4,
-    );
-  }
-  const script = join(cfg.bitoriaRoot, "scripts", "common", "scope_check.py");
-  const args = [script, target, "--assessment", cfg.assessment, "--technique", "lateral", "--checkpoint"];
-  if (confirmed) args.push("--confirmed");
-  const run = spawnSync("python3", args, { encoding: "utf8" });
-  if (run.status !== 0) {
-    const detail = `${run.stdout ?? ""}${run.stderr ?? ""}`.trim();
-    throw new GateError(
-      `scope/checkpoint denied for ${target} (exit ${run.status}). ` +
-        "Record the pivot (foothold, destination, mechanism, ports) in state/decisions.md, get human " +
-        "approval, then re-call with target + confirmed: true." +
-        (detail === "" ? "" : `\n${detail}`),
-      run.status ?? 1,
-    );
-  }
+  return null;
 }
 
-/** Append the call to <assessment>/logs/commands.log. Never the credential. */
+function ipv4ToInt(ip: string): number | null {
+  const parts = ip.split(".");
+  if (parts.length !== 4) return null;
+  let value = 0;
+  for (const part of parts) {
+    if (!/^\d{1,3}$/.test(part)) return null;
+    const octet = Number(part);
+    if (octet > 255) return null;
+    value = (value << 8) + octet;
+  }
+  return value >>> 0;
+}
+
+/** Host/CIDR membership. IPv4 ranges bit-compared; anything else exact-match. */
+export function targetInScope(scope: string[], target: string): boolean {
+  const host = target.replace(/^\[|\]$/g, "").split("/")[0].trim();
+  const hostInt = ipv4ToInt(host);
+  for (const raw of scope) {
+    const entry = raw.trim();
+    if (entry === "") continue;
+    if (entry.toLowerCase() === host.toLowerCase()) return true;
+    const [net, bitsRaw] = entry.split("/");
+    if (bitsRaw === undefined) continue;
+    const bits = Number(bitsRaw);
+    if (!Number.isInteger(bits) || bits < 0 || bits > 32) continue;
+    const netInt = ipv4ToInt(net);
+    if (netInt === null || hostInt === null) continue;
+    const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+    if ((hostInt & mask) === (netInt & mask)) return true;
+  }
+  return false;
+}
+
+/**
+ * The one gate, two modes.
+ *
+ * **Framework mode** (an assessment is active and the framework is present):
+ * `scope_check.py` runs the lateral hard checkpoint, exactly as a wrapper would,
+ * and the assessment's `ligolo.mcp` flag must be `true`. That flag is asked at
+ * assessment setup and is **off by default** — the MCP server is optional, so an
+ * engagement that never opted in keeps using the console wrapper.
+ *
+ * **Standalone mode** (no framework, no assessment): `LIGOLO_SCOPE` lists the
+ * hosts/CIDRs you are authorized to reach, and every reachability-changing call
+ * must name a target inside it *and* pass `confirmed: true`. This exists because
+ * the server must be usable outside BITORIA; refusing every pivot without a
+ * framework would make it a read-only viewer for anyone else.
+ *
+ * Neither mode configured → refuse and say so. There is deliberately no
+ * `--force`/`LIGOLO_GATE=off`: a gate that can be switched off is not a gate.
+ */
+export function assertScope(cfg: Config, target: string, confirmed: boolean): void {
+  const frameworkMode = cfg.assessment !== "" && cfg.bitoriaRoot !== null;
+
+  if (frameworkMode) {
+    const flag = assessmentMcpFlag(cfg);
+    if (flag !== true) {
+      throw new GateError(
+        `the ligolo MCP server is not enabled for assessment ${cfg.assessment}` +
+          (flag === null ? " (scope.yaml has no `ligolo:` block)" : " (`ligolo.mcp: false`)") +
+          ". It is off by default: either enable it with `ligolo:\n  mcp: true` in scope.yaml and re-run, " +
+          "or drive the pivot through scripts/pivoting/ligolo_console.sh instead.",
+        4,
+      );
+    }
+    const script = join(cfg.bitoriaRoot as string, "scripts", "common", "scope_check.py");
+    const args = [script, target, "--assessment", cfg.assessment, "--technique", "lateral", "--checkpoint"];
+    if (confirmed) args.push("--confirmed");
+    const run = spawnSync("python3", args, { encoding: "utf8" });
+    if (run.status !== 0) {
+      const detail = `${run.stdout ?? ""}${run.stderr ?? ""}`.trim();
+      throw new GateError(
+        `scope/checkpoint denied for ${target} (exit ${run.status}). ` +
+          "Record the pivot (foothold, destination, mechanism, ports) in state/decisions.md, get human " +
+          "approval, then re-call with target + confirmed: true." +
+          (detail === "" ? "" : `\n${detail}`),
+        run.status ?? 1,
+      );
+    }
+    return;
+  }
+
+  if (cfg.standaloneScope.length > 0) {
+    if (!targetInScope(cfg.standaloneScope, target)) {
+      throw new GateError(
+        `${target} is not inside LIGOLO_SCOPE (${cfg.standaloneScope.join(", ")}). ` +
+          "Standalone mode authorizes only the listed hosts/CIDRs; extend the list deliberately or name an " +
+          "authorized target.",
+        3,
+      );
+    }
+    if (!confirmed) {
+      throw new GateError(
+        `${target} is inside LIGOLO_SCOPE, but this is a hard checkpoint: re-call with confirmed: true after a ` +
+          "human has approved the pivot and it is written down (state/decisions.md when a framework is present).",
+        5,
+      );
+    }
+    return;
+  }
+
+  throw new GateError(
+    "no authorization source configured. Either activate a BITORIA assessment (with `ligolo.mcp: true`) and " +
+      "set LIGOLO_ASSESSMENT / LIGOLO_BITORIA_ROOT, or set LIGOLO_SCOPE to the hosts/CIDRs you are authorized " +
+      "to reach (comma-separated). Read-only tools work either way.",
+    4,
+  );
+}
+
 export function logCommand(cfg: Config, summary: string): void {
   if (cfg.assessment === "" || cfg.bitoriaRoot === null) return;
   const script = join(cfg.bitoriaRoot, "scripts", "common", "log_command.sh");

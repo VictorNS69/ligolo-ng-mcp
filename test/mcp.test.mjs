@@ -242,12 +242,28 @@ async function startServer({
   markerAssessment = null,
   markerAgeHours = 0,
   password = "testpass",
+  mcpFlag = true,
+  standaloneScope = "",
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), "ligolo-mcp-"));
   const framework = makeFramework(join(root, "framework"), { deny });
+  // The assessment's scope.yaml decides whether the MCP server is allowed for
+  // this engagement at all (`ligolo.mcp`, off by default like the Burp block).
+  const assessmentDir = join(framework, "assessments", "test-assessment", "state");
+  mkdirSync(assessmentDir, { recursive: true });
+  writeFileSync(
+    join(framework, "assessments", "test-assessment", "scope.yaml"),
+    mcpFlag === null
+      ? "in_scope:\n  hosts: ['10.0.0.0/8']\n"
+      : `in_scope:\n  hosts: ['10.0.0.0/8']\nligolo:\n  mcp: ${mcpFlag ? "true" : "false"}\n`,
+  );
   if (markerAssessment) {
     const stamp = new Date(Date.now() - markerAgeHours * 3_600_000).toISOString().replace(/\.\d+Z$/, "Z");
     mkdirSync(join(framework, "assessments", markerAssessment), { recursive: true });
+    writeFileSync(
+      join(framework, "assessments", markerAssessment, "scope.yaml"),
+      `in_scope:\n  hosts: ['10.0.0.0/8']\nligolo:\n  mcp: ${mcpFlag === false ? "false" : "true"}\n`,
+    );
     mkdirSync(join(framework, "state"), { recursive: true });
     writeFileSync(
       join(framework, "state", "assessment-scope.json"),
@@ -275,6 +291,7 @@ async function startServer({
       LIGOLO_SELFCERT_DOMAIN: certDomain,
       LIGOLO_PROXY_CONFIG: join(workdir, "ligolo-ng.yaml"),
       LIGOLO_MCP_READ_ONLY: readOnly ? "1" : "",
+      LIGOLO_SCOPE: standaloneScope,
       LIGOLO_NG_DIR: "",
       LIGOLO_PROXY_BIN: "",
     },
@@ -609,7 +626,8 @@ describe("assessment resolution", () => {
         confirmed: true,
       });
       assert.equal(isError, true);
-      assert.match(payload.message, /no active assessment/);
+      assert.equal(payload.exit_code, 4);
+      assert.match(payload.message, /no authorization source configured/);
       assert.deepEqual(mutatingCalls(h.state), []);
     } finally {
       await h.cleanup();
@@ -827,6 +845,124 @@ describe("instances", () => {
       const { isError, payload } = await h.client.call("ligolo_route_list", { instance: "ligolo7" });
       assert.equal(isError, true);
       assert.match(payload.message, /unknown or stopped instance 'ligolo7'/);
+    } finally {
+      await h.cleanup();
+    }
+  });
+});
+
+describe("authorization sources", () => {
+  it("refuses when the assessment has no ligolo block (off by default)", async () => {
+    const h = await startServer({ mcpFlag: null });
+    try {
+      const { isError, payload } = await h.client.call("ligolo_route_add", {
+        network: "172.16.5.0/24",
+        target: "172.16.5.9",
+        confirmed: true,
+      });
+      assert.equal(isError, true);
+      assert.equal(payload.exit_code, 4);
+      assert.match(payload.message, /not enabled for assessment test-assessment/);
+      assert.match(payload.message, /off by default/);
+      assert.deepEqual(mutatingCalls(h.state), []);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("refuses when the assessment sets ligolo.mcp: false", async () => {
+    const h = await startServer({ mcpFlag: false });
+    try {
+      const { isError, payload } = await h.client.call("ligolo_tunnel_start", {
+        agentId: "1",
+        target: "10.0.0.5",
+        confirmed: true,
+      });
+      assert.equal(isError, true);
+      assert.match(payload.message, /`ligolo\.mcp: false`/);
+      assert.deepEqual(mutatingCalls(h.state), []);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("works standalone: LIGOLO_SCOPE + confirmed authorizes an in-scope target", async () => {
+    const h = await startServer({
+      assessment: "",
+      standaloneScope: "172.16.5.0/24,10.10.10.5",
+    });
+    try {
+      const { isError, payload } = await h.client.call("ligolo_route_add", {
+        network: "172.16.5.0/24",
+        target: "172.16.5.9",
+        confirmed: true,
+      });
+      assert.equal(isError, false, JSON.stringify(payload));
+      assert.equal(payload.scope_checked, true);
+      const post = mutatingCalls(h.state).find((c) => c.path === "/api/v1/routes" && c.method === "POST");
+      assert.deepEqual(post.body, { Interface: "ligolo", Route: ["172.16.5.0/24"] });
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("still requires the human confirmation in standalone mode", async () => {
+    const h = await startServer({ assessment: "", standaloneScope: "172.16.5.0/24" });
+    try {
+      const { isError, payload } = await h.client.call("ligolo_route_add", {
+        network: "172.16.5.0/24",
+        target: "172.16.5.9",
+      });
+      assert.equal(isError, true);
+      assert.equal(payload.exit_code, 5);
+      assert.match(payload.message, /hard checkpoint/);
+      assert.deepEqual(mutatingCalls(h.state), []);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("refuses a standalone target outside LIGOLO_SCOPE, even when confirmed", async () => {
+    const h = await startServer({ assessment: "", standaloneScope: "10.10.10.0/24" });
+    try {
+      const { isError, payload } = await h.client.call("ligolo_route_add", {
+        network: "10.9.9.0/24",
+        target: "10.9.9.9",
+        confirmed: true,
+      });
+      assert.equal(isError, true);
+      assert.equal(payload.exit_code, 3);
+      assert.match(payload.message, /not inside LIGOLO_SCOPE/);
+      assert.deepEqual(mutatingCalls(h.state), []);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("explains both authorization sources when neither is configured", async () => {
+    const h = await startServer({ assessment: "", standaloneScope: "" });
+    try {
+      const { isError, payload } = await h.client.call("ligolo_listener_add", {
+        localAddress: "0.0.0.0:4444",
+        remoteAddress: "127.0.0.1:443",
+        agentId: "1",
+        target: "10.0.0.5",
+        confirmed: true,
+      });
+      assert.equal(isError, true);
+      assert.equal(payload.exit_code, 4);
+      assert.match(payload.message, /LIGOLO_SCOPE/);
+      assert.match(payload.message, /BITORIA assessment/);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("keeps read-only tools working with no authorization at all", async () => {
+    const h = await startServer({ assessment: "", standaloneScope: "" });
+    try {
+      const { isError } = await h.client.call("ligolo_agents_list");
+      assert.equal(isError, false);
     } finally {
       await h.cleanup();
     }

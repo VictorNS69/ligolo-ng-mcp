@@ -67,6 +67,14 @@ the internals are rewritten.
   `no such process`.
 - `ligolo_proxy_start` uses the real binary name (`proxy`).
 
+### Docs
+
+- `USAGE.md` — the operational path: prerequisites, registration for both
+  clients, an eight-step pivot with real request/response payloads, reverse
+  shell via `listener_add`, agent-localhost `240.0.0.0/4`, double pivot,
+  read-only mode, teardown discipline, what to do without the gate, how to read
+  `checkpoint-denied` vs `failed`, and raw-API calls by hand.
+
 ### Tests
 
 22 tests over real MCP stdio against a stub proxy API: gate denial leaves the

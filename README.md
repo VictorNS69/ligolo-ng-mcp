@@ -39,9 +39,11 @@ MCP client ──stdio──> ligolo-ng-mcp ──HTTP /api/v1──> ligolo pro
 >   live in `src/ligolo.ts`. Fix there, add a test, then run the live smoke
 >   test — that is the only check that exercises a real proxy.
 
+**Operational walkthrough with request/response examples: [USAGE.md](USAGE.md).**
+
 Contents: [Why this fork](#why-this-fork) · [Requirements](#requirements) ·
 [Install](#install) · [Configuration](#configuration) · [Typical
-flow](#typical-flow) · [The lateral-movement gate](#the-lateral-movement-gate) ·
+flow](#typical-flow) · [Usage](USAGE.md) · [The lateral-movement gate](#the-lateral-movement-gate) ·
 [Tools](#tools) · [HTTP endpoints used](#http-endpoints-used) ·
 [Breaking changes](#breaking-changes) · [Troubleshooting](#troubleshooting) ·
 [Development](#development) · [Security notes](#security-notes)
@@ -147,6 +149,10 @@ client's config.
 from a clone).
 
 ## Typical flow
+
+The condensed version — [USAGE.md](USAGE.md) has the same path with real
+request/response payloads, plus reverse shells, agent-localhost, double pivot,
+read-only mode and teardown discipline.
 
 1. `ligolo_proxy_start` (optionally `{ "port": "443", "rewriteConfig": true }`)
    → returns `{ running, pid, apiUrl, fingerprint }`. The config is seeded

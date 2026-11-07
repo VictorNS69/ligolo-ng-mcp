@@ -463,7 +463,9 @@ async function handleListenerAdd(args: Args): Promise<Payload> {
     agent_name: agent.Name,
     message: created.message,
     listener: mine[0] ?? null,
-    cleanup: `Record in state/cleanup-pending.md: listener ${local} -> ${remote} (${network}) on agent ${agentId}; revert with listener_stop ${mine[0]?.ListenerID ?? "<id>"}.`,
+    cleanup:
+      `Record in state/cleanup-pending.md: listener ${local} -> ${remote} (${network}) on agent ${agentId}; ` +
+      `revert with ligolo_listener_delete {listenerId: ${mine[0]?.ListenerID ?? "<id>"}, agentId: "${agentId}"}.`,
   };
 }
 

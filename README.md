@@ -43,9 +43,11 @@ MCP client ──stdio──> ligolo-ng-mcp ──HTTP /api/v1──> ligolo pro
 
 Contents: [Why this fork](#why-this-fork) · [Requirements](#requirements) ·
 [Install](#install) · [Configuration](#configuration) · [Typical
-flow](#typical-flow) · [Usage](USAGE.md) · [The lateral-movement gate](#the-lateral-movement-gate) ·
-[Tools](#tools) · [HTTP endpoints used](#http-endpoints-used) ·
-[Breaking changes](#breaking-changes) · [Troubleshooting](#troubleshooting) ·
+flow](#typical-flow) · [Usage](USAGE.md) · [Logs](#logs) ·
+[Multiple instances](#multiple-instances) ·
+[The lateral-movement gate](#the-lateral-movement-gate) · [Tools](#tools) ·
+[HTTP endpoints used](#http-endpoints-used) · [Breaking
+changes](#breaking-changes) · [Troubleshooting](#troubleshooting) ·
 [Development](#development) · [Security notes](#security-notes)
 
 ## Why this fork
@@ -118,6 +120,7 @@ npm run build
 | `LIGOLO_ASSESSMENT` | — | assessment name/path for the gate; when unset, the active-assessment marker is used |
 | `LIGOLO_BITORIA_ROOT` | auto-detected | framework checkout owning `scripts/common/scope_check.py` (walks up from cwd) |
 | `LIGOLO_MCP_READ_ONLY` | off | `1` registers only the 9 read-only tools |
+| `LIGOLO_ASSESSMENT` (effect) | — | when set/resolved, proxy logs go to `assessments/<name>/state/ligolo[<n>].log`; otherwise `<workspace>/ligolo[<n>].log` |
 
 Precedence: an explicit environment value wins; otherwise
 `.ligolo-mcp-credentials` (written next to the proxy config) supplies
@@ -179,6 +182,63 @@ read-only mode and teardown discipline.
    routes, tunnel, interface. Then delete the agent binary on the foothold and
    resolve the `cleanup-pending.md` entries.
 
+## Logs
+
+The proxy's stdout/stderr go to the **assessment's state tree**, because that is
+where engagement evidence belongs:
+
+| Instance | Log file |
+|---|---|
+| first (`ligolo`) | `assessments/<name>/state/ligolo.log` |
+| second (`ligolo2`) | `assessments/<name>/state/ligolo2.log` |
+| third (`ligolo3`) | `assessments/<name>/state/ligolo3.log` |
+
+Appended across restarts of the same instance, so the file accumulates the whole
+engagement's proxy history. With **no active assessment** there is no state tree
+to own it, so it falls back to `<workspace>/ligolo[<n>].log` (the workspace being
+`dirname(LIGOLO_PROXY_CONFIG)`).
+
+`ligolo_proxy_start` returns the resolved `logPath` and `ligolo_proxy_status`
+returns it per instance, so nothing has to be guessed. Two other streams exist
+and are *not* proxy logs: the MCP server's own diagnostics go to **stderr**
+(captured by the MCP client), and every tool call is appended to
+`<assessment>/logs/commands.log` through `log_command.sh`.
+
+Note the proxy also writes `<workspace>/ligolo-ng.yaml`, `ligolo-selfcerts/`
+(the fingerprint source) and a log for gin's HTTP layer only if `web.logfile` is
+set — this server seeds it empty.
+
+## Multiple instances
+
+Two proxies are legitimate: a second engagement in one session, a port already
+held by something else, or a segment that must not share routes with the first.
+Instance 1 is `ligolo`; each further instance is `ligolo2`, `ligolo3`, …
+
+```
+ligolo_proxy_start                       → ligolo   api :8080  agent :11601  state/ligolo.log
+ligolo_proxy_start                       → ligolo2  api :8081  agent :11602  state/ligolo2.log
+ligolo_proxy_start {"instance":"ligolo3"} → ligolo3  api :8082  agent :11603  state/ligolo3.log
+```
+
+Each instance gets its own API/agent ports (first free after the configured
+ones), its own workspace under `<workspace>/ligolo<N>/` (config, selfcert,
+credentials — so each has its own fingerprint), its own pid and log, and its own
+entry in `<workspace>/.ligolo-mcp-instances.json`. **Agent ids are per-proxy**, so
+every other tool takes an optional `instance` argument and defaults to `ligolo`:
+
+```json
+{"tool": "ligolo_agents_list", "arguments": {"instance": "ligolo2"}}
+{"tool": "ligolo_route_add", "arguments": {"instance": "ligolo2", "network": "10.9.9.0/24",
+                                            "target": "10.9.9.9", "confirmed": true}}
+```
+
+`ligolo_proxy_status` with no argument lists every live instance with its API
+URL and log path. Stopping is per instance (`ligolo_proxy_stop {"instance":
+"ligolo2"}`); a dead instance's manifest entry is pruned on the next start or
+status. If a proxy was started outside this server (by hand or by the console
+wrapper), status reports it as `managed: false` and the log path stays wherever
+that process put it.
+
 ## The lateral-movement gate
 
 `ligolo_tunnel_start`, `ligolo_route_add` and `ligolo_listener_add` make
@@ -211,6 +271,9 @@ the same marker (and the same 12h TTL) the framework's filesystem guard uses. An
 the pivot instead of authorizing it.
 
 ## Tools
+
+Every tool accepts an optional `instance` (default `ligolo`) — see
+[Multiple instances](#multiple-instances).
 
 Read-only (always registered, 9):
 
@@ -290,6 +353,11 @@ Versus upstream 1.0.0:
 - `ligolo_agent_command` pins the fingerprint and no longer defaults to
   `-ignore-cert`; `debugIgnoreCert: true` restores the old behaviour with a warning.
 - Errors are JSON (`isError: true`) instead of English prose.
+- 1.2.0: proxy logs moved from `<workspace>/ligolo-proxy.log` to
+  `<assessment>/state/ligolo.log` + the per-instance numbering above; every tool
+  gained the optional `instance` argument; `ligolo_proxy_start` gained `apiPort`
+  and `ligolo_proxy_status` returns a list instead of a single state when called
+  with no `instance`.
 
 ## Troubleshooting
 

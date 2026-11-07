@@ -13,7 +13,8 @@ Contents: [Before the first call](#before-the-first-call) · [Register the
 server](#register-the-server) · [Walkthrough: one pivot](#walkthrough-one-pivot) ·
 [Reverse shell through the pivot](#reverse-shell-through-the-pivot) ·
 [Agent-localhost services](#agent-localhost-services) · [Double pivot](#double-pivot) ·
-[Read-only mode](#read-only-mode) · [Teardown and cleanup](#teardown-and-cleanup) ·
+[Read-only mode](#read-only-mode) · [Logs and multiple
+instances](#logs-and-multiple-instances) · [Teardown and cleanup](#teardown-and-cleanup) ·
 [Running without the gate](#running-without-the-gate) ·
 [Reading the responses](#reading-the-responses) · [Raw API by hand](#raw-api-by-hand)
 
@@ -284,6 +285,56 @@ You can still pivot by hand: the endpoints in README §HTTP endpoints used do
 exactly what the hidden tools would, minus the checkpoint — which means doing it
 by hand is a deliberate act you must record yourself.
 
+## Logs and multiple instances
+
+The proxy log lands in the assessment's state tree, numbered per instance:
+
+```
+assessments/<name>/state/ligolo.log      # first instance
+assessments/<name>/state/ligolo2.log     # second
+assessments/<name>/state/ligolo3.log     # third
+```
+
+It is appended across restarts, so one file carries the whole engagement's
+proxy history for that instance. `ligolo_proxy_start` returns the path it chose
+(`logPath`), and it is worth recording that in `state/decisions.md` next to the
+pivot — an assessor reading the folder later should not have to guess which log
+belongs to which segment's proxy.
+
+Without an active assessment there is no state tree, so the file falls back to
+`<workspace>/ligolo[<n>].log`. Two other streams are not proxy logs: this
+server's own diagnostics go to stderr (the MCP client captures them), and every
+tool call is appended to `<assessment>/logs/commands.log`.
+
+**A second proxy** is a normal thing to need — another engagement in the same
+session, a port already taken, a segment that must not share routes. Just start
+another one; the server allocates the instance name, both ports, the workspace
+and the log:
+
+```
+ligolo_proxy_start                          → ligolo   api 127.0.0.1:8080  agent 0.0.0.0:11601
+ligolo_proxy_start                          → ligolo2  api 127.0.0.1:8081  agent 0.0.0.0:11602
+ligolo_proxy_start {"instance": "ligolo3"}  → ligolo3  api 127.0.0.1:8082  agent 0.0.0.0:11603
+```
+
+Each has its own `ligolo-ng.yaml`, selfcert cache (hence its own fingerprint —
+run `ligolo_certificate_fingerprint {"instance": "ligolo2"}` before generating
+that agent's command), credentials, pid and manifest entry. **Agent ids are
+per-proxy**: the same agent is `"1"` on both proxies, so every follow-up call
+must carry the instance it belongs to.
+
+```json
+{"tool": "ligolo_agents_list", "arguments": {"instance": "ligolo2"}}
+{"tool": "ligolo_tunnel_start", "arguments": {"instance": "ligolo2", "agentId": "1",
+                                               "tun": "ligolo2", "target": "10.9.9.9", "confirmed": true}}
+```
+
+Two habits that prevent the obvious mistakes: give each instance its own TUN
+name (`ligolo`, `ligolo2`, …) so `ip route` output stays readable, and check
+`ligolo_proxy_status` (no argument) before blaming a tool — it lists every live
+instance, its API URL and its log, and flags proxies this server did not start
+with `managed: false`.
+
 ## Teardown and cleanup
 
 ```json
@@ -311,8 +362,10 @@ What teardown does **not** do, and you must:
 - resolve every `state/cleanup-pending.md` row for the pivot;
 - record the teardown in `state/decisions.md` and flip the hosts in
   `state/hosts.md` to their post-pivot state;
-- stop the proxy (`ligolo_proxy_stop`) when the engagement's pivoting is done, and
-  optionally `sudo ip link del ligolo` if a stale interface is left behind.
+- stop the proxy (`ligolo_proxy_stop`, per instance) when the engagement's
+  pivoting is done, and optionally `sudo ip link del ligolo` if a stale
+  interface is left behind. The log file stays in `state/` as evidence; do not
+  delete it at teardown.
 
 ## Running without the gate
 

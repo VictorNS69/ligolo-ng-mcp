@@ -30,7 +30,10 @@ Nothing here grants authorization, and the gate exists precisely because
 - **TLS**: the agent should pin `-accept-fingerprint <sha256>`; `-ignore-cert`
   accepts any MITM and is exposed only behind an explicit debug flag.
 - **Local side effects**: the proxy creates/deletes TUN interfaces and routes,
-  and listeners create forwarding sockets on client hosts. Cleanup is explicit
+  and listeners create forwarding sockets on client hosts. Each instance's
+  manifest (`<workspace>/.ligolo-mcp-instances.json`, 0600) records pids, ports
+  and paths but never a password; credentials stay in the per-instance
+  `.ligolo-mcp-credentials` (0600). Cleanup is explicit
   (`ligolo_teardown`), and the agent binary on the foothold is never removed by
   this server.
 
@@ -38,7 +41,8 @@ Nothing here grants authorization, and the gate exists precisely because
 
 | Version | Supported |
 |---|---|
-| 1.1.x | yes |
+| 1.2.x | yes |
+| 1.1.x | security fixes only |
 | 1.0.x (upstream scaffold) | no — its tools could not move a packet |
 
 Tested against ligolo-ng proxy 0.9.1 and 0.9.2.

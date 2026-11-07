@@ -4,6 +4,40 @@ Fork of [`schwarztim/sec-ligolo-ng-mcp`](https://github.com/schwarztim/sec-ligol
 (MIT). Versions below are this fork's; `1.0.0` is the upstream initial release it
 started from.
 
+## 1.2.0 — 2026-11-07
+
+### Added
+
+- **Multiple proxy instances.** `ligolo_proxy_start` with no instance starts
+  `ligolo`, the next one starts `ligolo2`, and `{"instance": "ligolo3"}` names
+  one explicitly. Each instance gets its own API and agent ports (first free
+  after the configured ones), workspace (`<workspace>/ligolo<N>/`) with its own
+  config, selfcert cache and credentials, pid, log, and manifest entry in
+  `<workspace>/.ligolo-mcp-instances.json`.
+- Every tool accepts an optional `instance` argument (default `ligolo`), because
+  agent ids, routes and listeners are per-proxy.
+- `ligolo_proxy_start` accepts `apiPort` alongside `port`.
+- `ligolo_proxy_status` with no argument lists every live instance with API URL
+  and log path; an externally started proxy is reported with `managed: false`
+  plus a note, rather than as a stopped instance that is answering requests.
+
+### Changed
+
+- **Proxy logs moved into the assessment's state tree**:
+  `assessments/<name>/state/ligolo.log`, then `ligolo2.log`, `ligolo3.log` per
+  instance. Previously a single `<workspace>/ligolo-proxy.log`, which put
+  engagement evidence in a scratch directory and made a second proxy overwrite
+  the first's log. With no active assessment the file falls back to
+  `<workspace>/ligolo[<n>].log`.
+- `ligolo_proxy_stop` is per instance and prunes the manifest entry; dead
+  entries are also pruned on the next start or status.
+
+### Fixed
+
+- `seedConfig` returned the seeded workspace's password only via a mutated
+  config; it now returns it explicitly, so starting a second instance cannot
+  authenticate with the first instance's credential.
+
 ## 1.1.0 — 2026-11-07
 
 **Compatibility:** requires ligolo-ng proxy **0.9.x** (tested 0.9.1 and 0.9.2,

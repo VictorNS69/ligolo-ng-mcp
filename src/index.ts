@@ -35,10 +35,25 @@ import {
   AgentRecord,
   ListenerRecord,
 } from "./ligolo.js";
-import { applyPortOverride, proxyStatus, startProxy, stopProxy } from "./proxy.js";
+import { configForInstance, instanceStatus, listInstances, startProxy, stopProxy } from "./proxy.js";
 
 const cfg: Config = loadConfig();
-const api = new LigoloApi(cfg);
+
+/**
+ * Per-call instance scope.
+ *
+ * A single proxy is the normal case, so `instance` is optional everywhere and
+ * defaults to "ligolo". When two proxies run (two engagements in one session, a
+ * port already held, a segment that must not share routes), each tool call
+ * names its instance and gets that proxy's API URL, credentials and cert dir —
+ * agent ids are per-proxy, so mixing them up would route a tunnel through the
+ * wrong proxy.
+ */
+function ctx(args: Args): { c: Config; api: LigoloApi; instance: string } {
+  const instance = str(args, "instance");
+  const c = configForInstance(cfg, instance);
+  return { c, api: new LigoloApi(c), instance: instance === "" ? "ligolo" : instance };
+}
 
 type Args = Record<string, unknown>;
 
@@ -89,12 +104,19 @@ const AGENT_ID = {
   description: "Agent id from ligolo_agents_list (e.g. \"1\"). The console's \"selected session\" does not exist here.",
 } as const;
 
+const INSTANCE = {
+  type: "string",
+  description:
+    "Which proxy instance (\"ligolo\" by default, \"ligolo2\" for a second one). Agent ids, routes and listeners " +
+    "are per-proxy, so pass this whenever more than one proxy is running; ligolo_proxy_status lists them.",
+} as const;
+
 const readTools: Tool[] = [
   {
     name: "ligolo_proxy_status",
     description:
       "Check the ligolo proxy: API liveness (GET /api/v1/ping), pid, binary, config and log paths. Read-only.",
-    inputSchema: { type: "object" as const, properties: {}, required: [] },
+    inputSchema: { type: "object" as const, properties: { instance: INSTANCE }, required: [] },
     annotations: { readOnlyHint: true },
   },
   {
@@ -102,7 +124,7 @@ const readTools: Tool[] = [
     description:
       "List connected agents: name, session id, remote address, tunnel state and the full agent-side interface list " +
       "with addresses (this replaces the console's `ifconfig`). Read-only.",
-    inputSchema: { type: "object" as const, properties: {}, required: [] },
+    inputSchema: { type: "object" as const, properties: { instance: INSTANCE }, required: [] },
     annotations: { readOnlyHint: true },
   },
   {
@@ -112,7 +134,8 @@ const readTools: Tool[] = [
       "persistent session selection over the API — pass agentId to the tunnel/listener tools instead. Read-only.",
     inputSchema: {
       type: "object" as const,
-      properties: { sessionId: { type: "number", description: "Agent id from ligolo_agents_list" } },
+      properties: {
+        instance: INSTANCE, sessionId: { type: "number", description: "Agent id from ligolo_agents_list" } },
       required: ["sessionId"],
     },
     annotations: { readOnlyHint: true },
@@ -123,7 +146,8 @@ const readTools: Tool[] = [
       "Agent-side network detail: interfaces, flags, MTU and addresses. Optionally narrow to one agent id. Read-only.",
     inputSchema: {
       type: "object" as const,
-      properties: { sessionId: { type: "number", description: "Optional agent id" } },
+      properties: {
+        instance: INSTANCE, sessionId: { type: "number", description: "Optional agent id" } },
       required: [],
     },
     annotations: { readOnlyHint: true },
@@ -131,19 +155,19 @@ const readTools: Tool[] = [
   {
     name: "ligolo_interface_list",
     description: "Configured TUN interfaces with their routed destinations and active state. Read-only.",
-    inputSchema: { type: "object" as const, properties: {}, required: [] },
+    inputSchema: { type: "object" as const, properties: { instance: INSTANCE }, required: [] },
     annotations: { readOnlyHint: true },
   },
   {
     name: "ligolo_route_list",
     description: "Routes per interface, flattened, with active state. Read-only.",
-    inputSchema: { type: "object" as const, properties: {}, required: [] },
+    inputSchema: { type: "object" as const, properties: { instance: INSTANCE }, required: [] },
     annotations: { readOnlyHint: true },
   },
   {
     name: "ligolo_listener_list",
     description: "Active listeners/redirectors across agents (agent, listen addr, redirect addr, network, online). Read-only.",
-    inputSchema: { type: "object" as const, properties: {}, required: [] },
+    inputSchema: { type: "object" as const, properties: { instance: INSTANCE }, required: [] },
     annotations: { readOnlyHint: true },
   },
   {
@@ -151,7 +175,7 @@ const readTools: Tool[] = [
     description:
       "SHA-256 fingerprint of the proxy's cached selfcert, in the exact form `-accept-fingerprint` wants. Read-only, " +
       "no console needed. Errors if the proxy has not been started with -selfcert yet.",
-    inputSchema: { type: "object" as const, properties: {}, required: [] },
+    inputSchema: { type: "object" as const, properties: { instance: INSTANCE }, required: [] },
     annotations: { readOnlyHint: true },
   },
   {
@@ -162,6 +186,7 @@ const readTools: Tool[] = [
     inputSchema: {
       type: "object" as const,
       properties: {
+        instance: INSTANCE,
         proxyIp: { type: "string", description: "Address the foothold reaches the operator on" },
         port: { type: "string", description: "Proxy listen port", default: "11601" },
         fingerprint: { type: "string", description: "SHA-256 from ligolo_certificate_fingerprint" },
@@ -188,6 +213,7 @@ const writeTools: Tool[] = [
     inputSchema: {
       type: "object" as const,
       properties: {
+        instance: INSTANCE,
         port: {
           type: "string",
           description:
@@ -208,7 +234,7 @@ const writeTools: Tool[] = [
   {
     name: "ligolo_proxy_stop",
     description: "Stop the proxy process started by ligolo_proxy_start (SIGTERM via its pid file). Does not touch agents.",
-    inputSchema: { type: "object" as const, properties: {}, required: [] },
+    inputSchema: { type: "object" as const, properties: { instance: INSTANCE }, required: [] },
     annotations: { readOnlyHint: false, destructiveHint: true },
   },
   {
@@ -218,7 +244,8 @@ const writeTools: Tool[] = [
       "contacted, so no checkpoint is required.",
     inputSchema: {
       type: "object" as const,
-      properties: { name: { type: "string", description: "Interface name", default: "ligolo" } },
+      properties: {
+        instance: INSTANCE, name: { type: "string", description: "Interface name", default: "ligolo" } },
       required: [],
     },
     annotations: { readOnlyHint: false, destructiveHint: false },
@@ -231,6 +258,7 @@ const writeTools: Tool[] = [
     inputSchema: {
       type: "object" as const,
       properties: {
+        instance: INSTANCE,
         agentId: AGENT_ID,
         tun: { type: "string", description: "TUN interface name", default: "ligolo" },
         target: TARGET,
@@ -245,7 +273,8 @@ const writeTools: Tool[] = [
     description: "Stop an agent's tunnel (cleanup, not a new reachability transition). Logged, not checkpointed.",
     inputSchema: {
       type: "object" as const,
-      properties: { agentId: AGENT_ID },
+      properties: {
+        instance: INSTANCE, agentId: AGENT_ID },
       required: ["agentId"],
     },
     annotations: { readOnlyHint: false, destructiveHint: true },
@@ -258,6 +287,7 @@ const writeTools: Tool[] = [
     inputSchema: {
       type: "object" as const,
       properties: {
+        instance: INSTANCE,
         network: { type: "string", description: "CIDR to route (e.g. 10.10.10.0/24)" },
         interface: { type: "string", description: "TUN interface name", default: "ligolo" },
         target: TARGET,
@@ -273,6 +303,7 @@ const writeTools: Tool[] = [
     inputSchema: {
       type: "object" as const,
       properties: {
+        instance: INSTANCE,
         network: { type: "string", description: "CIDR to remove" },
         interface: { type: "string", description: "TUN interface name", default: "ligolo" },
       },
@@ -288,6 +319,7 @@ const writeTools: Tool[] = [
     inputSchema: {
       type: "object" as const,
       properties: {
+        instance: INSTANCE,
         localAddress: { type: "string", description: "Listen address on the agent (e.g. 0.0.0.0:4444)" },
         remoteAddress: { type: "string", description: "Operator-side target (e.g. 127.0.0.1:443)" },
         network: { type: "string", description: "tcp, tcp4, tcp6, udp, udp4, udp6", default: "tcp" },
@@ -305,6 +337,7 @@ const writeTools: Tool[] = [
     inputSchema: {
       type: "object" as const,
       properties: {
+        instance: INSTANCE,
         listenerId: { type: "number", description: "ListenerID from ligolo_listener_list" },
         agentId: AGENT_ID,
       },
@@ -320,6 +353,7 @@ const writeTools: Tool[] = [
     inputSchema: {
       type: "object" as const,
       properties: {
+        instance: INSTANCE,
         agentId: AGENT_ID,
         interface: { type: "string", description: "TUN interface to remove when deleteInterface is true", default: "ligolo" },
         deleteInterface: { type: "boolean", description: "Also delete the interface and its routes", default: false },
@@ -335,23 +369,32 @@ const tools: Tool[] = cfg.readOnly ? readTools : [...readTools, ...writeTools];
 type Payload = Record<string, unknown>;
 
 async function handleProxyStart(args: Args): Promise<Payload> {
-  applyPortOverride(cfg, str(args, "port"));
-  const state = await startProxy(cfg, bool(args, "rewriteConfig", false));
-  log(`ligolo_proxy_start api=${state.apiUrl} binary=${state.binary ?? "<missing>"}`);
+  const state = await startProxy(cfg, {
+    instance: str(args, "instance"),
+    port: str(args, "port"),
+    apiPort: str(args, "apiPort"),
+    rewriteConfig: bool(args, "rewriteConfig", false),
+  });
+  log(
+    `ligolo_proxy_start instance=${state.instance} api=${state.apiUrl} ` +
+      `binary=${state.binary ?? "<missing>"} log=${state.logPath}`,
+  );
   let fingerprint: string | null = null;
   let fingerprintError: string | null = null;
   try {
-    fingerprint = certFingerprint(cfg);
+    fingerprint = certFingerprint(configForInstance(cfg, state.instance));
   } catch (err) {
     fingerprintError = err instanceof Error ? err.message : String(err);
   }
   return { ...state, fingerprint, fingerprint_error: fingerprintError, scope_checked: false };
 }
 
-async function handleAgents(): Promise<Payload> {
+async function handleAgents(args: Args): Promise<Payload> {
+  const { api, instance } = ctx(args);
   const agents = await api.agents();
   return {
     scope_checked: false,
+    instance,
     count: Object.keys(agents ?? {}).length,
     agents: Object.entries(agents ?? {}).map(([id, a]) => ({
       agent_id: id,
@@ -365,9 +408,10 @@ async function handleAgents(): Promise<Payload> {
   };
 }
 
-function agentDetail(id: string, agent: AgentRecord): Payload {
+function agentDetail(id: string, agent: AgentRecord, instance: string): Payload {
   return {
     scope_checked: false,
+    instance,
     agent_id: id,
     name: agent.Name,
     session_id: agent.SessionID,
@@ -387,15 +431,16 @@ function agentDetail(id: string, agent: AgentRecord): Payload {
 }
 
 async function handleTunnelStart(args: Args): Promise<Payload> {
+  const { c, api, instance } = ctx(args);
   const agentId = str(args, "agentId");
-  const tun = str(args, "tun", cfg.interfaceName);
+  const tun = str(args, "tun", c.interfaceName);
   const target = str(args, "target");
   if (target === "") throw new Error("target is required: the in-scope host this tunnel makes reachable");
   const agent = await requireAgent(api, agentId);
   gate(
     target,
     bool(args, "confirmed", false),
-    `ligolo_tunnel_start agent=${agentId} (${agent.Name}) tun=${tun} target=${target}`,
+    `ligolo_tunnel_start instance=${instance} agent=${agentId} (${agent.Name}) tun=${tun} target=${target}`,
   );
   const interfaces = await api.interfaces();
   let interfaceCreated = false;
@@ -406,6 +451,7 @@ async function handleTunnelStart(args: Args): Promise<Payload> {
   const started = await api.startTunnel(agentId, tun);
   return {
     scope_checked: true,
+    instance,
     agent_id: agentId,
     agent_name: agent.Name,
     interface: tun,
@@ -419,9 +465,10 @@ async function handleTunnelStart(args: Args): Promise<Payload> {
 }
 
 async function handleRouteAdd(args: Args): Promise<Payload> {
+  const { c, api, instance } = ctx(args);
   const network = str(args, "network");
   if (network === "") throw new Error("network is required (a CIDR)");
-  const iface = str(args, "interface", cfg.interfaceName);
+  const iface = str(args, "interface", c.interfaceName);
   const explicitTarget = str(args, "target");
   const target = explicitTarget !== "" ? explicitTarget : network.endsWith("/32") ? network.slice(0, -3) : "";
   if (target === "") {
@@ -430,10 +477,11 @@ async function handleRouteAdd(args: Args): Promise<Payload> {
         "evaluated against something real (visible != authorized).",
     );
   }
-  gate(target, bool(args, "confirmed", false), `ligolo_route_add ${network} dev ${iface} target=${target}`);
+  gate(target, bool(args, "confirmed", false), `ligolo_route_add instance=${instance} ${network} dev ${iface} target=${target}`);
   const applied = await api.addRoutes(iface, [network]);
   return {
     scope_checked: true,
+    instance,
     network,
     interface: iface,
     message: applied.message,
@@ -442,6 +490,7 @@ async function handleRouteAdd(args: Args): Promise<Payload> {
 }
 
 async function handleListenerAdd(args: Args): Promise<Payload> {
+  const { api, instance } = ctx(args);
   const local = str(args, "localAddress");
   const remote = str(args, "remoteAddress");
   const agentId = str(args, "agentId");
@@ -452,13 +501,14 @@ async function handleListenerAdd(args: Args): Promise<Payload> {
   gate(
     target,
     bool(args, "confirmed", false),
-    `ligolo_listener_add agent=${agentId} addr=${local} to=${remote} network=${network} target=${target}`,
+    `ligolo_listener_add instance=${instance} agent=${agentId} addr=${local} to=${remote} network=${network} target=${target}`,
   );
   const created = await api.createListener(agentId, local, remote, network);
   const listeners = (await api.listeners()) ?? [];
   const mine = listeners.filter((l: ListenerRecord) => String(l.AgentID) === agentId && l.ListenerAddr === local);
   return {
     scope_checked: true,
+    instance,
     agent_id: agentId,
     agent_name: agent.Name,
     message: created.message,
@@ -470,10 +520,11 @@ async function handleListenerAdd(args: Args): Promise<Payload> {
 }
 
 async function handleTeardown(args: Args): Promise<Payload> {
+  const { c, api, instance } = ctx(args);
   const agentId = str(args, "agentId");
-  const iface = str(args, "interface", cfg.interfaceName);
+  const iface = str(args, "interface", c.interfaceName);
   const deleteInterface = bool(args, "deleteInterface", false);
-  log(`ligolo_teardown agent=${agentId} interface=${iface} delete_interface=${deleteInterface}`);
+  log(`ligolo_teardown instance=${instance} agent=${agentId} interface=${iface} delete_interface=${deleteInterface}`);
   const steps: Payload[] = [];
   const attempt = async (label: string, fn: () => Promise<unknown>): Promise<void> => {
     try {
@@ -509,6 +560,7 @@ async function handleTeardown(args: Args): Promise<Payload> {
   }
   return {
     scope_checked: false,
+    instance,
     agent_id: agentId,
     steps,
     note:
@@ -522,41 +574,67 @@ async function handleToolCall(name: string, args: Args): Promise<Payload> {
     case "ligolo_proxy_start":
       return handleProxyStart(args);
     case "ligolo_proxy_stop": {
-      const state = await stopProxy(cfg);
-      log(`ligolo_proxy_stop pid=${state.stoppedPid ?? "none"} running=${state.running}`);
+      const wanted = str(args, "instance");
+      const state = await stopProxy(cfg, wanted);
+      log(`ligolo_proxy_stop instance=${state.instance} pid=${state.stoppedPid ?? "none"} running=${state.running}`);
       return { ...state, scope_checked: false };
     }
-    case "ligolo_proxy_status":
+    case "ligolo_proxy_status": {
+      const wanted = str(args, "instance");
+      const compatibility =
+        "requires ligolo-ng proxy 0.9.x (tested 0.9.1, 0.9.2); the proxy API is experimental upstream";
+      if (wanted !== "") {
+        return { ...(await instanceStatus(cfg, wanted)), scope_checked: false, compatibility };
+      }
+      const { entries, logDir } = listInstances(cfg);
+      if (entries.length === 0) {
+        return { ...(await instanceStatus(cfg)), scope_checked: false, compatibility, instances: [] };
+      }
+      const states = await Promise.all(entries.map((e) => instanceStatus(cfg, e.name)));
       return {
-        ...(await proxyStatus(cfg)),
+        running: states.some((s) => s.running),
+        count: states.length,
+        instances: states,
+        log_dir: logDir,
+        apiUrl: states[0].apiUrl,
+        binary: cfg.proxyBin,
         scope_checked: false,
-        // Surfaced in-band because the doc warning is not read mid-run: if the
-        // proxy answers /ping but a later call 404s, this is the first place to
-        // look — the tested range is a claim about a specific release pair.
-        compatibility: "requires ligolo-ng proxy 0.9.x (tested 0.9.1, 0.9.2); the proxy API is experimental upstream",
+        compatibility,
       };
+    }
     case "ligolo_agents_list":
-      return handleAgents();
+      return handleAgents(args);
     case "ligolo_session_select": {
+      const { api, instance } = ctx(args);
       const id = num(args, "sessionId");
       if (id === null) throw new Error("sessionId is required (an agent id from ligolo_agents_list)");
-      return agentDetail(String(id), await requireAgent(api, String(id)));
+      return agentDetail(String(id), await requireAgent(api, String(id)), instance);
     }
     case "ligolo_agent_info": {
+      const { api, instance } = ctx(args);
       const id = num(args, "sessionId");
-      if (id === null) return handleAgents();
-      return agentDetail(String(id), await requireAgent(api, String(id)));
+      if (id === null) return handleAgents(args);
+      return agentDetail(String(id), await requireAgent(api, String(id)), instance);
     }
     case "ligolo_interface_create": {
-      const iface = str(args, "name", cfg.interfaceName);
-      log(`ligolo_interface_create ${iface}`);
+      const { c, api, instance } = ctx(args);
+      const iface = str(args, "name", c.interfaceName);
+      log(`ligolo_interface_create instance=${instance} ${iface}`);
       const created = await api.createInterface(iface);
-      return { scope_checked: false, interface: iface, message: created.message, interfaces: await api.interfaces() };
+      return {
+        scope_checked: false,
+        instance,
+        interface: iface,
+        message: created.message,
+        interfaces: await api.interfaces(),
+      };
     }
     case "ligolo_interface_list": {
+      const { api, instance } = ctx(args);
       const interfaces = await api.interfaces();
       return {
         scope_checked: false,
+        instance,
         interfaces: Object.entries(interfaces ?? {}).map(([name, rec]) => ({
           name,
           active: rec.Active,
@@ -567,59 +645,67 @@ async function handleToolCall(name: string, args: Args): Promise<Payload> {
     case "ligolo_tunnel_start":
       return handleTunnelStart(args);
     case "ligolo_tunnel_stop": {
+      const { api, instance } = ctx(args);
       const agentId = str(args, "agentId");
-      log(`ligolo_tunnel_stop agent=${agentId}`);
+      log(`ligolo_tunnel_stop instance=${instance} agent=${agentId}`);
       const stopped = await api.stopTunnel(agentId);
-      return { scope_checked: false, agent_id: agentId, message: stopped.message };
+      return { scope_checked: false, instance, agent_id: agentId, message: stopped.message };
     }
     case "ligolo_route_add":
       return handleRouteAdd(args);
     case "ligolo_route_delete": {
+      const { c, api, instance } = ctx(args);
       const network = str(args, "network");
-      const iface = str(args, "interface", cfg.interfaceName);
-      log(`ligolo_route_delete ${network} dev ${iface}`);
+      const iface = str(args, "interface", c.interfaceName);
+      log(`ligolo_route_delete instance=${instance} ${network} dev ${iface}`);
       const removed = await api.deleteRoute(iface, network);
-      return { scope_checked: false, network, interface: iface, message: removed.message };
+      return { scope_checked: false, instance, network, interface: iface, message: removed.message };
     }
     case "ligolo_route_list": {
+      const { api, instance } = ctx(args);
       const interfaces = await api.interfaces();
       const routes = Object.entries(interfaces ?? {}).flatMap(([name, rec]) =>
         (rec.Routes ?? []).map((r) => ({ interface: name, destination: r.Destination, active: r.Active })),
       );
-      return { scope_checked: false, count: routes.length, routes };
+      return { scope_checked: false, instance, count: routes.length, routes };
     }
     case "ligolo_listener_add":
       return handleListenerAdd(args);
     case "ligolo_listener_list": {
+      const { api, instance } = ctx(args);
       const listeners = (await api.listeners()) ?? [];
-      return { scope_checked: false, count: listeners.length, listeners };
+      return { scope_checked: false, instance, count: listeners.length, listeners };
     }
     case "ligolo_listener_delete": {
+      const { api, instance } = ctx(args);
       const listenerId = num(args, "listenerId");
       const agentId = str(args, "agentId");
       if (listenerId === null) throw new Error("listenerId is required (from ligolo_listener_list)");
       if (agentId === "") throw new Error("agentId is required — listeners are addressed per agent");
-      log(`ligolo_listener_delete agent=${agentId} listener=${listenerId}`);
+      log(`ligolo_listener_delete instance=${instance} agent=${agentId} listener=${listenerId}`);
       const deleted = await api.deleteListener(agentId, listenerId);
-      return { scope_checked: false, agent_id: agentId, listener_id: listenerId, message: deleted.message };
+      return { scope_checked: false, instance, agent_id: agentId, listener_id: listenerId, message: deleted.message };
     }
     case "ligolo_certificate_fingerprint": {
-      const fingerprint = certFingerprint(cfg);
+      const { c, instance } = ctx(args);
+      const fingerprint = certFingerprint(c);
       return {
         scope_checked: false,
+        instance,
         fingerprint,
-        path: `${cfg.selfcertDir}/${cfg.selfcertDomain}_cert`,
-        usage: `agent -connect <operator>:${cfg.proxyAddr.split(":").pop()} -accept-fingerprint ${fingerprint}`,
+        path: `${c.selfcertDir}/${c.selfcertDomain}_cert`,
+        usage: `agent -connect <operator>:${c.proxyAddr.split(":").pop()} -accept-fingerprint ${fingerprint}`,
       };
     }
     case "ligolo_agent_command": {
+      const { c, instance } = ctx(args);
       const proxyIp = str(args, "proxyIp");
-      const port = str(args, "port", cfg.proxyAddr.split(":").pop() ?? "11601");
+      const port = str(args, "port", c.proxyAddr.split(":").pop() ?? "11601");
       const retry = bool(args, "retry", true);
       const useWs = bool(args, "useWs", false);
       const debugIgnore = bool(args, "debugIgnoreCert", false);
       let fingerprint = str(args, "fingerprint");
-      if (fingerprint === "" && !debugIgnore) fingerprint = certFingerprint(cfg);
+      if (fingerprint === "" && !debugIgnore) fingerprint = certFingerprint(c);
       const flags: string[] = [];
       if (fingerprint !== "") flags.push(`-accept-fingerprint ${fingerprint}`);
       else if (debugIgnore) flags.push("-ignore-cert");
@@ -629,6 +715,7 @@ async function handleToolCall(name: string, args: Args): Promise<Payload> {
       const windows = `agent.exe -connect ${proxyIp}:${port} ${flags.join(" ")}`.trim();
       return {
         scope_checked: false,
+        instance,
         linux,
         windows,
         pinned: fingerprint !== "" && !debugIgnore,
@@ -646,7 +733,7 @@ async function handleToolCall(name: string, args: Args): Promise<Payload> {
 }
 
 async function main(): Promise<void> {
-  const server = new Server({ name: "ligolo-ng-mcp", version: "1.1.0" }, { capabilities: { tools: {} } });
+  const server = new Server({ name: "ligolo-ng-mcp", version: "1.2.0" }, { capabilities: { tools: {} } });
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
 
@@ -683,9 +770,10 @@ async function main(): Promise<void> {
   await server.connect(new StdioServerTransport());
   // stdout is the MCP stream; diagnostics go to stderr only.
   console.error(
-    `ligolo-ng-mcp 1.1.0 ready — api=${cfg.apiUrl} ` +
+    `ligolo-ng-mcp 1.2.0 ready — api=${cfg.apiUrl} ` +
       `assessment=${cfg.assessment || "<unset>"}(${cfg.assessmentSource}) ` +
-      `read_only=${cfg.readOnly} tools=${tools.length} framework=${cfg.bitoriaRoot ?? "<not found>"}`,
+      `read_only=${cfg.readOnly} tools=${tools.length} framework=${cfg.bitoriaRoot ?? "<not found>"} ` +
+      `logs=${cfg.assessment === "" ? "<workspace>/ligolo[<n>].log" : `assessments/${cfg.assessment}/state/ligolo[<n>].log`}`,
   );
 }
 

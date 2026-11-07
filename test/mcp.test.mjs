@@ -412,7 +412,7 @@ describe("lateral-movement gate", () => {
       const post = mutatingCalls(h.state).find((c) => c.path === "/api/v1/routes" && c.method === "POST");
       assert.deepEqual(post.body, { Interface: "ligolo", Route: ["172.16.5.0/24"] });
       const audit = readFileSync(join(h.framework, "commands.log"), "utf8");
-      assert.match(audit, /ligolo_route_add 172\.16\.5\.0\/24 dev ligolo/);
+      assert.match(audit, /ligolo_route_add instance=ligolo 172\.16\.5\.0\/24 dev ligolo/);
     } finally {
       await h.cleanup();
     }
@@ -573,6 +573,7 @@ describe("proxy lifecycle", () => {
       const { isError, payload } = await h.client.call("ligolo_proxy_status");
       assert.equal(isError, false);
       assert.equal(payload.running, true);
+      assert.equal(payload.managed, false, "a proxy this server did not spawn is reported as external");
       assert.match(payload.compatibility, /ligolo-ng proxy 0\.9\.x \(tested 0\.9\.1, 0\.9\.2\)/);
       assert.equal(payload.apiUrl, process.env.LIGOLO_API ?? payload.apiUrl);
       assert.ok(existsSync(dirname(payload.configPath)));
@@ -619,7 +620,7 @@ describe("assessment resolution", () => {
 describe("credential seeding", () => {
   it("generates a 0600 credential file when no password is supplied", async () => {
     const { loadConfig } = await import("../dist/ligolo.js");
-    const { seedConfig } = await import("../dist/proxy.js");
+    const { seedConfig, planInstance } = await import("../dist/proxy.js");
     const root = mkdtempSync(join(tmpdir(), "ligolo-seed-"));
     const cfg = loadConfig(
       {
@@ -633,21 +634,22 @@ describe("credential seeding", () => {
       root,
     );
     assert.equal(cfg.password, "");
-    const seeded = seedConfig(cfg, false);
+    const spec = planInstance(cfg, {});
+    const seeded = seedConfig(cfg, spec, false);
     assert.equal(seeded.created, true);
-    assert.match(cfg.password, /^[0-9a-f]{48}$/, "the in-memory config must pick the generated password up");
+    assert.match(seeded.password, /^[0-9a-f]{48}$/, "seedConfig must return the generated password");
     const credsPath = join(root, ".ligolo-mcp-credentials");
     assert.ok(existsSync(credsPath), "credential file must be written");
     const creds = JSON.parse(readFileSync(credsPath, "utf8"));
     assert.equal(creds.user, "ligolo");
-    assert.equal(creds.password, cfg.password);
+    assert.equal(creds.password, seeded.password);
     assert.equal(statSync(credsPath).mode & 0o777, 0o600);
     const yaml = readFileSync(join(root, "ligolo-ng.yaml"), "utf8");
     assert.match(yaml, /enabled: true/);
     assert.match(yaml, /enableui: false/);
-    assert.match(yaml, new RegExp(`ligolo: "${cfg.password}"`));
+    assert.match(yaml, new RegExp(`ligolo: "${seeded.password}"`));
     // second call must not rewrite an existing, usable config
-    const again = seedConfig(cfg, false);
+    const again = seedConfig(cfg, planInstance(cfg, {}), false);
     assert.equal(again.created, false);
   });
 });
@@ -678,5 +680,155 @@ describe("agent-facing port override", () => {
     assert.throws(() => applyPortOverride(cfg, "0.0.0.0:443"), /invalid port/);
     assert.throws(() => applyPortOverride(cfg, "70000"), /invalid port/);
     assert.equal(cfg.proxyAddr, "0.0.0.0:11601");
+  });
+});
+
+describe("log placement", () => {
+  const mkCfg = async (root, extra = {}) => {
+    const { loadConfig } = await import("../dist/ligolo.js");
+    mkdirSync(join(root, "assessments", "test-assessment", "state"), { recursive: true });
+    return loadConfig(
+      {
+        LIGOLO_PROXY_CONFIG: join(root, "ws", "ligolo-ng.yaml"),
+        LIGOLO_SELFCERT_DIR: join(root, "ws", "ligolo-selfcerts"),
+        LIGOLO_ASSESSMENT: "test-assessment",
+        LIGOLO_BITORIA_ROOT: root,
+        ...extra,
+      },
+      root,
+    );
+  };
+
+  it("writes the proxy log into the assessment state tree", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ligolo-log-"));
+    const cfg = await mkCfg(root);
+    const { planInstance } = await import("../dist/proxy.js");
+    const spec = planInstance(cfg, {});
+    assert.equal(spec.logPath, join(root, "assessments", "test-assessment", "state", "ligolo.log"));
+  });
+
+  it("numbers a second instance ligolo2.log and shifts both ports", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ligolo-log2-"));
+    const cfg = await mkCfg(root);
+    const { planInstance } = await import("../dist/proxy.js");
+    const first = planInstance(cfg, {});
+    // a live first instance, as the manifest would hold it
+    mkdirSync(join(root, "ws"), { recursive: true });
+    writeFileSync(
+      join(root, "ws", ".ligolo-mcp-instances.json"),
+      JSON.stringify({
+        ligolo: {
+          name: "ligolo", index: 1, pid: process.pid,
+          apiUrl: "http://127.0.0.1:8080", proxyAddr: "0.0.0.0:11601",
+          configPath: first.configPath, credsPath: first.credsPath, selfcertDir: first.selfcertDir,
+          workspace: first.workspace, logPath: first.logPath, assessment: "test-assessment",
+          startedAt: new Date().toISOString(),
+        },
+      }),
+    );
+    const second = planInstance(cfg, {});
+    assert.equal(second.name, "ligolo2");
+    assert.equal(second.index, 2);
+    assert.equal(second.logPath, join(root, "assessments", "test-assessment", "state", "ligolo2.log"));
+    assert.equal(second.proxyAddr, "0.0.0.0:11602", "agent port must not collide with instance 1");
+    assert.equal(second.apiUrl, "http://127.0.0.1:8081", "API port must not collide with instance 1");
+    assert.equal(second.configPath, join(root, "ws", "ligolo2", "ligolo-ng.yaml"), "own workspace per instance");
+    const third = planInstance(cfg, { instance: "ligolo3" });
+    assert.equal(third.logPath, join(root, "assessments", "test-assessment", "state", "ligolo3.log"));
+  });
+
+  it("falls back to the workspace when no assessment is active", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ligolo-log3-"));
+    const { loadConfig } = await import("../dist/ligolo.js");
+    const { planInstance } = await import("../dist/proxy.js");
+    const cfg = loadConfig(
+      {
+        LIGOLO_PROXY_CONFIG: join(root, "ws", "ligolo-ng.yaml"),
+        LIGOLO_SELFCERT_DIR: join(root, "ws", "ligolo-selfcerts"),
+        LIGOLO_ASSESSMENT: "",
+        LIGOLO_BITORIA_ROOT: "",
+      },
+      root,
+    );
+    assert.equal(planInstance(cfg, {}).logPath, join(root, "ws", "ligolo.log"));
+    assert.equal(planInstance(cfg, { instance: "ligolo2" }).logPath, join(root, "ws", "ligolo2.log"));
+  });
+
+  it("reports the log path and instance in proxy_start's payload shape", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ligolo-log4-"));
+    const cfg = await mkCfg(root);
+    const { planInstance } = await import("../dist/proxy.js");
+    const spec = planInstance(cfg, {});
+    assert.match(spec.logPath, /assessments\/test-assessment\/state\/ligolo\.log$/);
+    assert.equal(spec.name, "ligolo");
+  });
+});
+
+describe("instances", () => {
+  it("exposes an `instance` parameter on every tool", async () => {
+    const h = await startServer();
+    try {
+      const listed = await h.client.request("tools/list");
+      for (const tool of listed.tools) {
+        assert.ok(
+          tool.inputSchema?.properties?.instance,
+          `${tool.name} must accept an instance parameter`,
+        );
+      }
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("routes a call to the named instance's API", async () => {
+    const h = await startServer();
+    const second = makeApi();
+    await new Promise((r) => second.server.listen(0, "127.0.0.1", r));
+    const port2 = second.server.address().port;
+    try {
+      const manifest = {
+        ligolo2: {
+          name: "ligolo2",
+          index: 2,
+          pid: process.pid,
+          apiUrl: `http://127.0.0.1:${port2}`,
+          proxyAddr: "0.0.0.0:11602",
+          configPath: join(h.workdir, "ligolo2", "ligolo-ng.yaml"),
+          credsPath: join(h.workdir, "ligolo2", ".ligolo-mcp-credentials"),
+          selfcertDir: join(h.workdir, "ligolo2", "ligolo-selfcerts"),
+          workspace: join(h.workdir, "ligolo2"),
+          logPath: join(h.workdir, "ligolo2.log"),
+          assessment: "test-assessment",
+          startedAt: new Date().toISOString(),
+        },
+      };
+      writeFileSync(join(h.workdir, ".ligolo-mcp-instances.json"), JSON.stringify(manifest));
+
+      h.state.calls.length = 0;
+      const { isError, payload } = await h.client.call("ligolo_route_list", { instance: "ligolo2" });
+      assert.equal(isError, false, JSON.stringify(payload));
+      assert.equal(payload.instance, "ligolo2");
+      assert.equal(second.state.calls.length, 1, "the call must reach instance 2's API");
+      assert.equal(second.state.calls[0].path, "/api/v1/interfaces");
+      assert.equal(h.state.calls.length, 0, "instance 1's API must not be touched");
+
+      h.state.calls.length = 0;
+      await h.client.call("ligolo_route_list");
+      assert.equal(h.state.calls.length, 1, "omitting instance uses the default proxy");
+    } finally {
+      await new Promise((r) => second.server.close(r));
+      await h.cleanup();
+    }
+  });
+
+  it("refuses a call to an instance that is not running", async () => {
+    const h = await startServer();
+    try {
+      const { isError, payload } = await h.client.call("ligolo_route_list", { instance: "ligolo7" });
+      assert.equal(isError, true);
+      assert.match(payload.message, /unknown or stopped instance 'ligolo7'/);
+    } finally {
+      await h.cleanup();
+    }
   });
 });

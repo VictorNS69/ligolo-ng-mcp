@@ -40,3 +40,12 @@ pids
 *.pid
 *.seed
 *.pid.lock
+
+# Ligolo proxy runtime state (written beside LIGOLO_PROXY_CONFIG; the default
+# config path is ./ligolo-ng.yaml, so a clone run must not commit these)
+ligolo-ng.yaml
+ligolo-ng.history
+ligolo-selfcerts/
+ligolo-proxy.log
+.ligolo-mcp-credentials
+.ligolo-mcp-proxy.pid

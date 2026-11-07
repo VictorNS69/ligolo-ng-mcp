@@ -32,6 +32,16 @@
   "files": [
     "dist",
     "README.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
     "LICENSE"
-  ]
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VictorNS69/ligolo-ng-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/VictorNS69/ligolo-ng-mcp/issues"
+  },
+  "homepage": "https://github.com/VictorNS69/ligolo-ng-mcp#readme"
 }

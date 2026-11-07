@@ -1,0 +1,32 @@
+# Keep the dependency surface current — and keep the audit clean.
+#
+# Why grouped and weekly rather than one PR per bump: this server has one
+# runtime dependency (@modelcontextprotocol/sdk) that drags in express/hono/zod
+# transitively, so an SDK bump alone clears most advisories. One grouped PR per
+# ecosystem is reviewable; seven transitive PRs (the state of the repository this
+# fork came from) is how a security update sits unmerged for months.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    groups:
+      mcp-sdk:
+        patterns:
+          - "@modelcontextprotocol/sdk"
+      tooling:
+        patterns:
+          - "typescript"
+          - "@types/*"
+    commit-message:
+      prefix: chore(deps)
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: chore(ci)

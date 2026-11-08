@@ -4,6 +4,57 @@ Fork of [`schwarztim/sec-ligolo-ng-mcp`](https://github.com/schwarztim/sec-ligol
 (MIT). Versions below are this fork's; `1.0.0` is the upstream initial release it
 started from.
 
+## 1.4.0 — 2026-11-08
+
+Field report from a five-host, four-hop pivot driven entirely through this
+server (`assessments/2026_11_08_bigpivoting_dockerlabs` in BITORIA-Hermes).
+Every item below is a failure the run actually hit.
+
+### Fixed
+
+- **Unknown arguments are rejected instead of silently dropped.** A call with
+  `listenAddr`/`redirectAddr` (this tool's real names are
+  `localAddress`/`remoteAddress`) used to pass its `agentId`/`target` checks,
+  send an empty listener address to the proxy, and come back as
+  `HTTP 500: invalid listener addr: missing port in address` — a caller's typo
+  reported as a server fault. Dispatch now validates the argument names against
+  the tool's declared schema, lists the accepted ones, and suggests the nearest
+  declared name for a plain typo (`localAdress` → `did you mean localAddress?`).
+- **`ligolo_route_add` validates the CIDR before calling the API.**
+  `{"network":"not-a-cidr"}` used to reach the proxy and return
+  `POST /api/v1/routes -> HTTP 500: interface ligolo not found`, which named a
+  different problem entirely and spent the scope gate on an impossible request.
+  Now: `network "not-a-cidr" is not a CIDR — expected <address>/<prefix>`.
+- **An already-present route is a success.** Routes outlive
+  `ligolo_tunnel_stop`/`tunnel_start`, so the natural retry after a tunnel
+  restart hit `HTTP 500: route <cidr> already exists` with `isError: true`.
+  It now returns `already_present: true`, `scope_checked: true`, and the message
+  `route <cidr> already present on <iface>`.
+- **`ligolo_listener_add` reports every bad argument at once** and checks that
+  `localAddress`/`remoteAddress` actually look like `host:port`. Previously a
+  caller learned `target` was missing, fixed it, then learned `agentId` was bad,
+  one round trip per problem.
+- **`ligolo_interface_create` no longer claims to have created a device.** The
+  call only registers the interface in the proxy's config; the reply now carries
+  `registered: true`, `os_created: "unknown"` and a `hint` naming
+  `ip -d link show <iface>` plus the `ip tuntap add` fallback. Previously
+  `"message": "Interface ligolo created."` was returned on a host where no
+  kernel device existed, and the gap only surfaced later at `tunnel_start`.
+
+### Added
+
+- **`ligolo_proxy_start {reuse: true}`** returns the instance already running
+  instead of starting the next one. Without it, a retry (or a call after a
+  timeout) silently started `ligolo2` on the next port with a new workspace and
+  selfcert, leaving the caller with two proxies and two fingerprints.
+
+### Tests
+
+- `test/mcp.test.mjs`: the fake proxy now rejects duplicate routes like the real
+  one, plus five cases for the behaviour above (unknown argument + typo
+  suggestion, non-CIDR network, already-present route, aggregated listener
+  arguments, registry-vs-device wording). 42 tests, all passing.
+
 ## 1.3.1 — 2026-11-07
 
 ### Security

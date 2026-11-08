@@ -226,6 +226,14 @@ const writeTools: Tool[] = [
           description: "Rewrite an existing ligolo-ng.yaml that lacks web.enabled/web.users (backup written first)",
           default: false,
         },
+        reuse: {
+          type: "boolean",
+          description:
+            "Return the instance that is already running instead of starting another. Without it, a retried " +
+            "call (or a call after a timeout) starts the next instance, with a new port, workspace and " +
+            "selfcert, leaving the caller with two proxies and two fingerprints.",
+          default: false,
+        },
       },
       required: [],
     },
@@ -364,11 +372,111 @@ const writeTools: Tool[] = [
   },
 ];
 
+/** Single source for the version reported over MCP and in the startup banner. */
+const VERSION = "1.4.0";
+
 const tools: Tool[] = cfg.readOnly ? readTools : [...readTools, ...writeTools];
+
+/** Declared argument names per tool, used to reject unknown keys.
+ *
+ * An unknown key used to be dropped silently: `ligolo_listener_add` called with
+ * `listenAddr`/`redirectAddr` (real names: `localAddress`/`remoteAddress`)
+ * forwarded an empty listener address to the proxy and came back as
+ * `HTTP 500: invalid listener addr: missing port in address` — a caller-side typo
+ * reported as a server fault, after the agent/target checks had already run and
+ * made the call look validated. Reject the call instead, naming the near miss.
+ */
+const ARG_NAMES: ReadonlyMap<string, ReadonlySet<string>> = new Map(
+  tools.map((t) => {
+    const props = (t.inputSchema as { properties?: Record<string, unknown> }).properties ?? {};
+    return [t.name, new Set(Object.keys(props))] as const;
+  }),
+);
+
+function editDistance(a: string, b: string): number {
+  const m = a.length;
+  const n = b.length;
+  if (m === 0 || n === 0) return Math.max(m, n);
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = new Array<number>(n + 1);
+    cur[0] = i;
+    for (let j = 1; j <= n; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  return prev[n];
+}
+
+/** Closest declared name within a small edit distance, so a typo gets a suggestion. */
+function nearestName(wanted: string, candidates: ReadonlySet<string>): string | null {
+  const lower = wanted.toLowerCase();
+  let best: { name: string; d: number } | null = null;
+  for (const name of candidates) {
+    const d = editDistance(lower, name.toLowerCase());
+    if (best === null || d < best.d) best = { name, d };
+  }
+  if (best === null) return null;
+  const threshold = Math.max(2, Math.floor(wanted.length / 3));
+  return best.d <= threshold ? best.name : null;
+}
+
+function rejectUnknownArgs(name: string, args: Args): void {
+  const known = ARG_NAMES.get(name);
+  if (known === undefined) return;
+  const unknown = Object.keys(args ?? {}).filter((k) => !known.has(k));
+  if (unknown.length === 0) return;
+  const named = unknown.map((k) => {
+    const near = nearestName(k, known);
+    return near === null ? k : `${k} (did you mean ${near}?)`;
+  });
+  throw new Error(
+    `unknown argument(s) for ${name}: ${named.join(", ")}. Accepted: ${[...known].join(", ")}`,
+  );
+}
+
+/** IPv4/IPv6 CIDR with a mandatory, in-range prefix length. */
+function isCidr(value: string): boolean {
+  const parts = value.split("/");
+  if (parts.length !== 2) return false;
+  const [addr, prefix] = parts;
+  if (prefix === "" || !/^\d{1,3}$/.test(prefix)) return false;
+  const bits = Number(prefix);
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(addr);
+  if (v4 !== null) {
+    return v4.slice(1).every((o) => Number(o) <= 255) && bits >= 0 && bits <= 32;
+  }
+  if (addr.includes(":")) {
+    return /^[0-9a-fA-F:.]+$/.test(addr) && bits >= 0 && bits <= 128;
+  }
+  return false;
+}
 
 type Payload = Record<string, unknown>;
 
 async function handleProxyStart(args: Args): Promise<Payload> {
+  if (bool(args, "reuse", false)) {
+    const wanted = str(args, "instance");
+    const existing = await instanceStatus(cfg, wanted).catch(() => null);
+    if (existing !== null && existing.running) {
+      let fingerprint: string | null = null;
+      let fingerprintError: string | null = null;
+      try {
+        fingerprint = certFingerprint(configForInstance(cfg, existing.instance));
+      } catch (err) {
+        fingerprintError = err instanceof Error ? err.message : String(err);
+      }
+      log(`ligolo_proxy_start reuse=true instance=${existing.instance} pid=${existing.pid ?? "none"}`);
+      return {
+        ...existing,
+        reused: true,
+        fingerprint,
+        fingerprint_error: fingerprintError,
+        scope_checked: false,
+      };
+    }
+  }
   const state = await startProxy(cfg, {
     instance: str(args, "instance"),
     port: str(args, "port"),
@@ -468,6 +576,13 @@ async function handleRouteAdd(args: Args): Promise<Payload> {
   const { c, api, instance } = ctx(args);
   const network = str(args, "network");
   if (network === "") throw new Error("network is required (a CIDR)");
+  if (!isCidr(network)) {
+    throw new Error(
+      `network "${network}" is not a CIDR — expected <address>/<prefix> (e.g. 20.20.20.0/24, 10.10.10.2/32). ` +
+        "Unvalidated it reached the proxy as a route and came back as an unrelated HTTP 500 " +
+        "(\"interface not found\"), which reads like a server fault instead of a bad argument.",
+    );
+  }
   const iface = str(args, "interface", c.interfaceName);
   const explicitTarget = str(args, "target");
   const target = explicitTarget !== "" ? explicitTarget : network.endsWith("/32") ? network.slice(0, -3) : "";
@@ -478,7 +593,27 @@ async function handleRouteAdd(args: Args): Promise<Payload> {
     );
   }
   gate(target, bool(args, "confirmed", false), `ligolo_route_add instance=${instance} ${network} dev ${iface} target=${target}`);
-  const applied = await api.addRoutes(iface, [network]);
+  let applied: { message: string };
+  try {
+    applied = await api.addRoutes(iface, [network]);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // Routes outlive tunnel_stop/tunnel_start, so the natural retry after a
+    // tunnel restart hits "already exists" while the desired end state is
+    // exactly what is in place. That is success, not failure.
+    if (/already exists|already present/i.test(message)) {
+      return {
+        scope_checked: true,
+        instance,
+        network,
+        interface: iface,
+        already_present: true,
+        message: `route ${network} already present on ${iface}`,
+        note: "No change made; the segment is already routed through this interface.",
+      };
+    }
+    throw err;
+  }
   return {
     scope_checked: true,
     instance,
@@ -496,7 +631,26 @@ async function handleListenerAdd(args: Args): Promise<Payload> {
   const agentId = str(args, "agentId");
   const network = str(args, "network", "tcp");
   const target = str(args, "target");
-  if (target === "") throw new Error("target is required: the foothold/segment host the listener sits on");
+  // Report every missing/invalid argument at once: failing on the first one made
+  // a caller spend a round trip per problem (target, then agentId, then addr).
+  const missing: string[] = [];
+  if (agentId === "") missing.push("agentId (from ligolo_agents_list)");
+  if (local === "") missing.push("localAddress (agent-side listen address, host:port)");
+  if (remote === "") missing.push("remoteAddress (operator-side redirect address, host:port)");
+  if (target === "") missing.push("target (the foothold/segment host the listener sits on)");
+  const malformed: string[] = [];
+  for (const [field, value] of [["localAddress", local], ["remoteAddress", remote]] as const) {
+    if (value !== "" && !/^[^\s:]+:\d{1,5}$/.test(value)) {
+      malformed.push(`${field} "${value}" is not host:port`);
+    }
+  }
+  if (missing.length > 0 || malformed.length > 0) {
+    throw new Error(
+      "ligolo_listener_add needs valid arguments: " +
+        [...missing, ...malformed].join("; ") +
+        ". Nothing was sent to the proxy.",
+    );
+  }
   const agent = await requireAgent(api, agentId);
   gate(
     target,
@@ -570,6 +724,7 @@ async function handleTeardown(args: Args): Promise<Payload> {
 }
 
 async function handleToolCall(name: string, args: Args): Promise<Payload> {
+  rejectUnknownArgs(name, args);
   switch (name) {
     case "ligolo_proxy_start":
       return handleProxyStart(args);
@@ -625,7 +780,18 @@ async function handleToolCall(name: string, args: Args): Promise<Payload> {
         scope_checked: false,
         instance,
         interface: iface,
+        registered: true,
+        // The API call only adds the interface to the proxy's own config. Whether
+        // a kernel tun device exists is a separate fact, and reporting the two as
+        // one "created" claim sent an operator straight into a confusing
+        // tunnel_start failure on hosts where the device was never made.
+        os_created: "unknown",
         message: created.message,
+        hint:
+          `"${created.message}" means the proxy accepted the interface in its config — it is not proof of a ` +
+          `kernel device. Check with \`ip -d link show ${iface}\`: the proxy creates it at tunnel_start when the ` +
+          `binary holds CAP_NET_ADMIN, otherwise create it once with ` +
+          `\`sudo ip tuntap add user $USER mode tun ${iface} && sudo ip link set ${iface} up\`.`,
         interfaces: await api.interfaces(),
       };
     }
@@ -733,7 +899,7 @@ async function handleToolCall(name: string, args: Args): Promise<Payload> {
 }
 
 async function main(): Promise<void> {
-  const server = new Server({ name: "ligolo-ng-mcp", version: "1.3.1" }, { capabilities: { tools: {} } });
+  const server = new Server({ name: "ligolo-ng-mcp", version: VERSION }, { capabilities: { tools: {} } });
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
 
@@ -770,7 +936,7 @@ async function main(): Promise<void> {
   await server.connect(new StdioServerTransport());
   // stdout is the MCP stream; diagnostics go to stderr only.
   console.error(
-    `ligolo-ng-mcp 1.3.1 ready — api=${cfg.apiUrl} ` +
+    `ligolo-ng-mcp ${VERSION} ready — api=${cfg.apiUrl} ` +
       `assessment=${cfg.assessment || "<unset>"}(${cfg.assessmentSource}) ` +
       `read_only=${cfg.readOnly} tools=${tools.length} framework=${cfg.bitoriaRoot ?? "<not found>"} ` +
       `logs=${cfg.assessment === "" ? "<workspace>/ligolo[<n>].log" : `assessments/${cfg.assessment}/state/ligolo[<n>].log`}`,

@@ -435,6 +435,37 @@ Common follow-ups while running:
 
 More failure modes, including version drift: README §Troubleshooting.
 
+## Argument validation and idempotency
+
+Every tool call is checked against the tool's declared argument names before
+anything reaches the proxy. An unknown key is an error, not a no-op:
+
+```json
+{"error": "failed", "message": "unknown argument(s) for ligolo_listener_add: listenAddr, redirectAddr. Accepted: instance, localAddress, remoteAddress, network, agentId, target, confirmed"}
+```
+
+The listener's address fields are `localAddress` (agent side) and
+`remoteAddress` (operator side) — both `host:port`. Old habit names
+(`listenAddr`, `redirectAddr`) are rejected with the accepted list, and a plain
+typo gets a suggestion (`localAdress` → `did you mean localAddress?`).
+
+Three calls are idempotent on purpose, because a multi-hop chain retries them
+after every tunnel restart:
+
+| Call | Re-running it |
+|---|---|
+| `ligolo_route_add` | returns `already_present: true` when the CIDR is already routed — a retry after `ligolo_tunnel_stop`/`tunnel_start` is a success, not an error |
+| `ligolo_proxy_start {reuse: true}` | returns the running instance instead of starting `ligolo2` on the next port with a new selfcert |
+| `ligolo_tunnel_start` | safe to repeat; `interface_created` tells you whether the tun device had to be made |
+
+`ligolo_interface_create` registers the interface in the proxy's config; it does
+not prove a kernel device exists. The reply says so (`registered: true`,
+`os_created: "unknown"`) and its `hint` gives the check (`ip -d link show
+ligolo`) and the fix (`sudo ip tuntap add user $USER mode tun ligolo`). The proxy
+creates the device itself at `tunnel_start` when the binary holds
+`CAP_NET_ADMIN` (`setcap cap_net_admin=ep /opt/ligolo-ng/linux/proxy`), which is
+how a four-hop chain builds four interfaces without sudo.
+
 ## Raw API by hand
 
 Useful for debugging the MCP layer, scripting without an MCP client, or the

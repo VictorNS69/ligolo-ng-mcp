@@ -121,6 +121,10 @@ function makeApi() {
       }
       if (url === "/api/v1/routes" && req.method === "POST") {
         const rec = (state.interfaces[parsed.Interface] ??= { Routes: [], Active: true });
+        // The real proxy answers 500 for a route it already has; the fake has to
+        // reproduce that or the idempotency path below is never exercised.
+        const dup = parsed.Route.find((r) => rec.Routes.some((existing) => existing.Destination === r));
+        if (dup !== undefined) return send(500, { error: `route ${dup} already exists` });
         for (const r of parsed.Route) rec.Routes.push({ Destination: r, Active: true });
         return send(200, { message: `Routes ${parsed.Route} added.` });
       }
@@ -963,6 +967,108 @@ describe("authorization sources", () => {
     try {
       const { isError } = await h.client.call("ligolo_agents_list");
       assert.equal(isError, false);
+    } finally {
+      await h.cleanup();
+    }
+  });
+});
+
+describe("argument validation and proxy error mapping", () => {
+  it("rejects an unknown argument and names the near miss, without calling the API", async () => {
+    const h = await startServer();
+    try {
+      const { isError, payload } = await h.client.call("ligolo_listener_add", {
+        agentId: "1",
+        listenAddr: "0.0.0.0:11601",
+        redirectAddr: "10.0.0.1:11601",
+        target: "172.16.5.9",
+        confirmed: true,
+      });
+      assert.equal(isError, true);
+      assert.match(payload.message, /unknown argument\(s\) for ligolo_listener_add: listenAddr, redirectAddr/);
+      // No near-miss guess here on purpose: both 0.0.0.0-side names are equally
+      // close to "addr", so the useful part of the message is the accepted list.
+      assert.match(payload.message, /Accepted: .*localAddress.*remoteAddress/);
+      assert.deepEqual(mutatingCalls(h.state), [], "a rejected call must not reach the proxy");
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("suggests the declared name for a plain typo", async () => {
+    const h = await startServer();
+    try {
+      const { isError, payload } = await h.client.call("ligolo_listener_add", {
+        agentId: "1",
+        localAdress: "0.0.0.0:11601",
+        remoteAddress: "10.0.0.1:11601",
+        target: "172.16.5.9",
+        confirmed: true,
+      });
+      assert.equal(isError, true);
+      assert.match(payload.message, /localAdress \(did you mean localAddress\?\)/);
+      assert.deepEqual(mutatingCalls(h.state), []);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("rejects a non-CIDR network before the route call", async () => {
+    const h = await startServer();
+    try {
+      const { isError, payload } = await h.client.call("ligolo_route_add", {
+        network: "not-a-cidr",
+        target: "172.16.5.9",
+        confirmed: true,
+      });
+      assert.equal(isError, true);
+      assert.match(payload.message, /is not a CIDR/);
+      assert.deepEqual(mutatingCalls(h.state), []);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("treats an already-present route as success", async () => {
+    const h = await startServer();
+    try {
+      h.state.interfaces.ligolo = { Routes: [{ Destination: "172.16.5.0/24", Active: true }], Active: true };
+      const { isError, payload } = await h.client.call("ligolo_route_add", {
+        network: "172.16.5.0/24",
+        target: "172.16.5.9",
+        confirmed: true,
+      });
+      assert.equal(isError, false);
+      assert.equal(payload.already_present, true);
+      assert.equal(payload.scope_checked, true);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("reports every missing listener argument in one response", async () => {
+    const h = await startServer();
+    try {
+      const { isError, payload } = await h.client.call("ligolo_listener_add", {});
+      assert.equal(isError, true);
+      for (const field of ["agentId", "localAddress", "remoteAddress", "target"]) {
+        assert.match(payload.message, new RegExp(field));
+      }
+      assert.match(payload.message, /Nothing was sent to the proxy/);
+      assert.deepEqual(mutatingCalls(h.state), []);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("reports interface_create as a registry action, not a device", async () => {
+    const h = await startServer();
+    try {
+      const { isError, payload } = await h.client.call("ligolo_interface_create", { name: "ligolo" });
+      assert.equal(isError, false);
+      assert.equal(payload.registered, true);
+      assert.equal(payload.os_created, "unknown");
+      assert.match(payload.hint, /ip -d link show ligolo/);
     } finally {
       await h.cleanup();
     }

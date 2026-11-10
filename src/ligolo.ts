@@ -465,10 +465,29 @@ export class LigoloApi {
     return parsed;
   }
 
+  /**
+   * Credentials are minted by `proxy_start` *after* this server has loaded its
+   * config, so a process started first holds an empty password forever — the
+   * proxy runs, `proxy_status` answers, and every API call fails with "no API
+   * credentials" even though `.ligolo-mcp-credentials` exists on disk. Re-read
+   * that file on demand rather than trusting the startup snapshot.
+   */
+  private refreshCredsFromDisk(): void {
+    if (this.cfg.token !== "" || this.cfg.password !== "") return;
+    const path = this.cfg.credsPath ?? "";
+    if (path === "" || !existsSync(path)) return;
+    const fresh = readCreds(path);
+    if (fresh.password) {
+      this.cfg.password = fresh.password;
+      if (fresh.user) this.cfg.user = fresh.user;
+    }
+  }
+
   private async authToken(force = false): Promise<string> {
     if (!force && this.tokenValue !== "" && (this.tokenExpiry === 0 || this.tokenExpiry - 30 > Date.now() / 1000)) {
       return this.tokenValue;
     }
+    this.refreshCredsFromDisk();
     if (this.cfg.password === "" && this.cfg.token === "") {
       throw new Error(
         "no API credentials: set LIGOLO_PASSWORD (and LIGOLO_USER) or LIGOLO_TOKEN. " +
@@ -527,8 +546,22 @@ export class LigoloApi {
     return this.call("POST", "/api/v1/routes", { Interface: iface, Route: routes });
   }
 
-  deleteRoute(iface: string, route: string): Promise<{ message: string }> {
-    return this.call("DELETE", "/api/v1/routes", { Interface: iface, Route: route });
+  /**
+   * Removing a route that is already gone (its interface was deleted first, or
+   * the tunnel was stopped) comes back as HTTP 500 "no such process" — the
+   * desired end state, reported as a failure. Cleanup must be idempotent, so
+   * treat that specific case as success and say so.
+   */
+  async deleteRoute(iface: string, route: string): Promise<{ message: string }> {
+    try {
+      return await this.call("DELETE", "/api/v1/routes", { Interface: iface, Route: route });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/HTTP 500/.test(msg) && /no such process/i.test(msg)) {
+        return { message: `Route ${route} on ${iface} was already absent — nothing to remove.` };
+      }
+      throw err;
+    }
   }
 
   startTunnel(agentId: string, iface: string): Promise<{ message: string }> {

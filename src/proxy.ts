@@ -20,6 +20,7 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
+import net from "node:net";
 import { dirname, join } from "node:path";
 
 import { Ledger } from "./ledger.js";
@@ -209,6 +210,29 @@ function portOf(addr: string): number {
   const tail = addr.slice(addr.lastIndexOf(":") + 1);
   const port = Number(tail);
   return Number.isInteger(port) && port > 0 && port < 65536 ? port : 0;
+}
+
+/**
+ * Can this process bind ``addr`` right now?
+ *
+ * ``nextFreePort`` only avoids colliding with *our own* live instances; it
+ * cannot see another tool already holding the port. Measured 2026-11-10: the
+ * registered API listen address was `127.0.0.1:8080`, which Burp's proxy
+ * listener held, and the proxy was spawned anyway — the bind failed inside the
+ * child, the child died, and the only symptom at the MCP surface was
+ * `/api/auth returned no token` on a later, unrelated call. Ask the kernel
+ * before spawning instead.
+ */
+export async function portFree(addr: string): Promise<boolean> {
+  const host = addr.includes(":") ? addr.slice(0, addr.lastIndexOf(":")) : "127.0.0.1";
+  const port = portOf(addr);
+  if (port === 0) return true;
+  return await new Promise<boolean>((resolvePort) => {
+    const server = net.createServer();
+    server.once("error", () => resolvePort(false));
+    server.once("listening", () => server.close(() => resolvePort(true)));
+    server.listen({ host: host === "" ? "0.0.0.0" : host, port, exclusive: true });
+  });
 }
 
 function nextFreePort(addr: string, taken: Set<number>): string {
@@ -542,6 +566,24 @@ export async function startProxy(
       );
     }
     /* nothing listening — start it */
+  }
+
+  // Nothing answers as ligolo on this API address, so a bind here would race
+  // whatever else holds the port. Refuse with the tenant named and the knob
+  // that moves us, rather than spawning a child that dies silently.
+  const apiListen = spec.apiUrl.replace(/^https?:\/\//, "");
+  if (!(await portFree(apiListen))) {
+    throw new Error(
+      `ligolo proxy API port ${apiListen} is already bound by another process and does not answer /api/v1/ping as a ligolo proxy. ` +
+        `Set LIGOLO_API/LIGOLO_API_LISTEN, or pass apiPort (ligolo_proxy_start {"apiPort":"<free port>"}), before starting — ` +
+        `the ligolo API and Burp's proxy listener both default to 127.0.0.1:8080, so this collision is the normal case on a web target.`,
+    );
+  }
+  if (!(await portFree(spec.proxyAddr))) {
+    throw new Error(
+      `ligolo agent-facing port ${spec.proxyAddr} is already bound by another process. ` +
+        `Pass port (ligolo_proxy_start {"port":"<free port>"}) or change LIGOLO_PROXY_ADDR, or the proxy cannot listen for agents.`,
+    );
   }
 
   mkdirSync(dirname(spec.logPath), { recursive: true });

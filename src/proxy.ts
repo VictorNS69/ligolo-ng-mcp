@@ -25,7 +25,8 @@ import { randomBytes } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
-import { Config, LigoloApi, readCreds } from "./ligolo.js";
+import { Ledger } from "./ledger.js";
+import { Config, isLoopback, LigoloApi, listenHost, readCreds } from "./ligolo.js";
 
 /** One running (or configured) proxy instance. */
 export interface InstanceEntry {
@@ -56,7 +57,84 @@ export interface ProxyState {
   assessment: string;
   /** true when this server owns the process; false for an externally started proxy. */
   managed?: boolean;
+  webui: WebUiState;
   note?: string;
+}
+
+/**
+ * What the observer WebUI looks like for an instance, as read from its config.
+ * The human's password is deliberately absent: this lands in tool output, i.e.
+ * in the agent's context.
+ */
+export interface WebUiState {
+  enabled: boolean;
+  url?: string;
+  /** What to type into the UI's login form ("API URL" + user). */
+  login?: { api_url: string; user: string | null };
+  note?: string;
+}
+
+const WEBUI_NOTE =
+  "Observer UI for a human operator. It is NOT read-only: changes made there bypass the lateral checkpoint and " +
+  "the audit log. This server labels them origin: \"external\" in the list tools and ligolo_proxy_status.";
+
+export function webUiState(cfg: Config, configPath: string, apiUrl: string): WebUiState {
+  let text = "";
+  try {
+    text = readFileSync(configPath, "utf8");
+  } catch {
+    return { enabled: false };
+  }
+  if (!/^\s*enableui:\s*true\b/m.test(text)) return { enabled: false };
+  const userListed = new RegExp(`^\\s+${escapeRe(cfg.webUiUser)}:`, "m").test(text);
+  return {
+    enabled: true,
+    url: `${apiUrl}/`,
+    login: { api_url: apiUrl, user: userListed ? cfg.webUiUser : null },
+    note: WEBUI_NOTE,
+  };
+}
+
+function escapeRe(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Refuse a WebUI request that would weaken the deployment, before anything is
+ * written or spawned:
+ *  - the UI only ever listens on loopback (reach it remotely with `ssh -L`);
+ *  - the human brings their own password (LIGOLO_WEBUI_PASSWORD). Generating
+ *    one would mean printing it somewhere — and every channel this server has
+ *    (tool output, the creds file, stderr) is one the agent can read;
+ *  - the human's user is not the agent's user, or revoking one revokes both.
+ */
+export function assertWebUiAllowed(cfg: Config, apiUrl: string): void {
+  if (!cfg.webUi) return;
+  const host = listenHost(apiUrl);
+  const problems: string[] = [];
+  if (!isLoopback(host)) {
+    problems.push(
+      `the API listens on ${host}, not loopback — the WebUI is only served on 127.0.0.1/::1 ` +
+        "(set LIGOLO_API_LISTEN=127.0.0.1:<port> and reach it remotely with `ssh -L`)",
+    );
+  }
+  if (cfg.webUiPassword === "") {
+    problems.push(
+      "LIGOLO_WEBUI_PASSWORD is not set — the human operator's password is never generated, because every place " +
+        "this server could hand it over is readable by the agent",
+    );
+  }
+  if (cfg.webUiUser === cfg.user) {
+    problems.push(
+      `LIGOLO_WEBUI_USER (${cfg.webUiUser}) is the same as the MCP's API user — give the human their own account`,
+    );
+  }
+  if (!/^[A-Za-z0-9._-]+$/.test(cfg.webUiUser)) {
+    problems.push(`LIGOLO_WEBUI_USER "${cfg.webUiUser}" must be [A-Za-z0-9._-]+`);
+  }
+  if (problems.length > 0) {
+    throw new Error(`LIGOLO_WEBUI=1 refused: ${problems.join("; ")}. Nothing was started.`);
+  }
 }
 
 function alive(pid: number): boolean {
@@ -125,10 +203,29 @@ function writeManifest(cfg: Config, entries: Record<string, InstanceEntry>): voi
   writeFileSync(file, `${JSON.stringify(entries, null, 2)}\n`, { mode: 0o600 });
 }
 
-/** Instances whose pid is still alive; entries for dead processes are dropped. */
+/**
+ * Is `entry.pid` still *that* proxy? A pid is reused once its process exits, so
+ * "alive" alone let a stale manifest entry point at an unrelated process — and
+ * ligolo_proxy_stop would SIGTERM it. On Linux the spawned proxy's argv carries
+ * `-config <configPath>`, which identifies it; elsewhere fall back to liveness.
+ */
+function isOurProxy(entry: InstanceEntry): boolean {
+  if (!Number.isInteger(entry.pid) || !alive(entry.pid)) return false;
+  const proc = `/proc/${entry.pid}/cmdline`;
+  if (!existsSync("/proc/self/cmdline")) return true;
+  try {
+    const argv = readFileSync(proc, "utf8").split("\0");
+    const at = argv.indexOf("-config");
+    return at !== -1 && argv[at + 1] === entry.configPath;
+  } catch {
+    return false;
+  }
+}
+
+/** Instances whose proxy is still running; entries for dead (or pid-reused) processes are dropped. */
 export function liveInstances(cfg: Config): InstanceEntry[] {
   const all = readManifest(cfg);
-  const live = Object.values(all).filter((e) => Number.isInteger(e.pid) && alive(e.pid));
+  const live = Object.values(all).filter(isOurProxy);
   if (live.length !== Object.keys(all).length) {
     writeManifest(cfg, Object.fromEntries(live.map((e) => [e.name, e])));
   }
@@ -275,8 +372,11 @@ export function configForInstance(cfg: Config, name?: string): Config {
 /**
  * Write the minimum config that makes the proxy headless and API-only:
  *
- *  - web.enabled / web.enableui: the REST API is what we drive; the browser
- *    UI and its first-run prompt are not wanted.
+ *  - web.enabled / web.enableui: the REST API is what we drive. The browser
+ *    UI stays off unless LIGOLO_WEBUI=1, which turns it on as an observer
+ *    for a human, with its own `web.users` entry and the CORS origin set to
+ *    the listener it is served from. (Writing the file ourselves is also
+ *    what avoids the proxy's interactive "Enable WebUI?" first-run prompt.)
  *  - web.logfile: "" — otherwise every start drops a gin `ui.log` in the
  *    working directory.
  *  - web.users: a plaintext password here is what /api/auth needs; the proxy
@@ -305,6 +405,20 @@ export function seedConfig(
           "or add `web.enabled: true` + `web.users` to it yourself.",
       );
     }
+    if (cfg.webUi) {
+      const uiOn = /^\s*enableui:\s*true\b/m.test(existing);
+      const userOn = new RegExp(`^\\s+${escapeRe(cfg.webUiUser)}:`, "m").test(existing);
+      if (!uiOn || !userOn) {
+        throw new Error(
+          `LIGOLO_WEBUI=1, but ${path} ` +
+            [!uiOn ? "has web.enableui off" : "", !userOn ? `has no web.users entry for ${cfg.webUiUser}` : ""]
+              .filter((v) => v !== "")
+              .join(" and ") +
+            ". Re-call ligolo_proxy_start with rewriteConfig: true (the original is backed up as .bak; " +
+            "routes and interfaces stored in it are dropped), or edit it yourself.",
+        );
+      }
+    }
     if (!existsSync(spec.credsPath) && existingCreds.password === undefined) {
       writeFileSync(spec.credsPath, JSON.stringify({ user: cfg.user, password }, null, 2), { mode: 0o600 });
     }
@@ -322,20 +436,27 @@ export function seedConfig(
   // config and a hand-driven `curl` can still read the credential.
   writeFileSync(spec.credsPath, JSON.stringify({ user: cfg.user, password }, null, 2), { mode: 0o600 });
 
+  // The human's plaintext only exists here until the proxy's first load, which
+  // re-hashes every web.users entry to argon2id and rewrites the file (0600).
   const yaml = [
     "proxy:",
     `  historyfile: ${JSON.stringify(join(spec.workspace, "ligolo-ng.history"))}`,
     `  selfcertcache: ${JSON.stringify(spec.selfcertDir)}`,
     "web:",
     "  enabled: true",
-    "  enableui: false",
+    `  enableui: ${cfg.webUi ? "true" : "false"}`,
     `  listen: ${JSON.stringify(spec.apiUrl.replace(/^https?:\/\//, ""))}`,
     '  logfile: ""',
+    ...(cfg.webUi ? ["  corsallowedorigin:", `    - ${JSON.stringify(spec.apiUrl)}`] : []),
     "  users:",
     `    ${cfg.user}: ${JSON.stringify(password)}`,
+    ...(cfg.webUi ? [`    ${cfg.webUiUser}: ${JSON.stringify(cfg.webUiPassword)}`] : []),
     "",
   ].join("\n");
   writeFileSync(path, yaml, { mode: 0o600 });
+  // A freshly seeded config has no interfaces or routes, so nothing on this
+  // proxy was made by the MCP yet.
+  Ledger.reset(path);
   return { created: true, backup, path, password };
 }
 
@@ -350,6 +471,7 @@ function stateOf(cfg: Config, spec: InstanceSpec, entry: InstanceEntry | null): 
     configPath: spec.configPath,
     logPath: spec.logPath,
     assessment: cfg.assessment,
+    webui: webUiState(cfg, spec.configPath, spec.apiUrl),
   };
 }
 
@@ -372,8 +494,12 @@ export async function instanceStatus(cfg: Config, name?: string): Promise<ProxyS
   } catch {
     reachable = false;
   }
+  // Report the URL this server actually talks to (LIGOLO_API), not the listen
+  // address it would plan for a proxy of its own: for a proxy started elsewhere
+  // (a container, the console wrapper) the two differ, and webui.url sent the
+  // human to a port nothing was serving.
   return {
-    ...stateOf(cfg, spec, null),
+    ...stateOf(cfg, { ...spec, apiUrl: cfg.apiUrl }, null),
     running: reachable,
     managed: false,
     note: reachable
@@ -408,17 +534,39 @@ export async function startProxy(
   }
 
   const spec = planInstance(cfg, opts);
+  assertWebUiAllowed(cfg, spec.apiUrl);
   const seeded = seedConfig(cfg, spec, Boolean(opts.rewriteConfig));
   const scoped = { ...cfg, apiUrl: spec.apiUrl, password: seeded.password };
   const api = new LigoloApi(scoped);
 
-  // Already answering on this instance's API: nothing to spawn.
+  // Something already answers on this instance's API port. Spawning anyway
+  // used to start a second proxy that could not bind, while the ping loop below
+  // got its "pong" from the *other* process and recorded the doomed child's pid
+  // as a managed instance.
   try {
     await api.ping();
     const existing = liveInstances(cfg).find((e) => e.index === spec.index);
     if (existing) return { ...stateOf(scoped, spec, existing), seeded: false };
-  } catch {
-    /* not up — start it */
+    return {
+      ...stateOf(scoped, spec, null),
+      running: true,
+      pid: null,
+      managed: false,
+      seeded: Boolean(seeded.created),
+      note:
+        `a proxy not started by this server already answers ${spec.apiUrl}; nothing was spawned. ` +
+        "Use it as is, stop it where it was started, or pass apiPort/instance for a separate one.",
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/HTTP \d{3}/.test(message)) {
+      throw new Error(
+        `${spec.apiUrl} is already served by something that rejects this server's API call (${message}). ` +
+          "It is either a proxy with other credentials or another service; nothing was spawned. Free the port, " +
+          "or pass apiPort for a different one.",
+      );
+    }
+    /* nothing listening — start it */
   }
 
   mkdirSync(dirname(spec.logPath), { recursive: true });

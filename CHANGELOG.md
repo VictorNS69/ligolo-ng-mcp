@@ -4,6 +4,74 @@ Fork of [`schwarztim/sec-ligolo-ng-mcp`](https://github.com/schwarztim/sec-ligol
 (MIT). Versions below are this fork's; `1.0.0` is the upstream initial release it
 started from.
 
+## 1.5.0 — 2026-11-11
+
+### Added
+
+- **Observer WebUI (`LIGOLO_WEBUI=1`).** Agents drive the pivot through the MCP;
+  a human watches it live in ligolo's own WebUI, served on the same loopback API
+  listener. Seeds `web.enableui: true`, `corsallowedorigin` and a separate
+  `web.users` entry (`LIGOLO_WEBUI_USER`, default `operator`). `ligolo_proxy_start`
+  and `ligolo_proxy_status` return `webui: {enabled, url, login, note}`.
+  Refused, before anything is written, on a non-loopback listener, without
+  `LIGOLO_WEBUI_PASSWORD`, or when the human user equals `LIGOLO_USER`. The
+  human password is never generated, returned, or written to
+  `.ligolo-mcp-credentials`. Verified live against proxy 0.9.1.
+- **Origin of proxy state.** A per-instance ledger
+  (`.ligolo-mcp-ledger.json`) records what this server created. Route,
+  interface and listener lists carry `origin: "mcp" | "external"`;
+  `ligolo_agents_list` carries `tunnel_origin`; `ligolo_proxy_status` reports
+  `outside_mcp` (external state, and MCP-made state removed elsewhere).
+
+### Fixed
+
+- **Read-only mode only hid the mutating tools.** With `LIGOLO_MCP_READ_ONLY=1`
+  they were missing from `tools/list`, but a client calling `ligolo_route_add`
+  by name still ran the gate and reached the proxy API. Dispatch now accepts
+  only registered tools and answers `not available: this server runs read-only`.
+- **`apiPort` on `ligolo_proxy_start` was read but never declared**, so the
+  unknown-argument check rejected every call that passed it.
+- **No second proxy over one that already answers.** If the planned API port
+  was served by a proxy this server did not start, `ligolo_proxy_start` spawned
+  another one that could not bind, got its readiness "pong" from the other
+  process, and recorded the doomed child's pid as a managed instance. It now
+  reports the running proxy (`managed: false`, nothing spawned), and refuses
+  with a clear message when the port answers with an HTTP error.
+- **A recycled pid is no longer treated as our proxy.** A manifest entry whose
+  pid had been reused by an unrelated process counted as live, and
+  `ligolo_proxy_stop` would SIGTERM that process. On Linux the entry must match
+  the proxy's `-config <path>` in `/proc/<pid>/cmdline`.
+- **`LIGOLO_API` defaults to `LIGOLO_API_LISTEN`.** Setting only the listen
+  address started the proxy there while status and unmanaged calls probed :8080.
+- **A TUN device left by an earlier proxy gets an actionable error.** With
+  `CAP_NET_ADMIN`, kernel TUNs outlive the proxy, and a fresh config then failed
+  with `TUNSETIFF failed … device or resource busy`. The error now names the
+  leftover device and how to remove it. Seen against proxy 0.9.1.
+
+- **Found in a Docker double-pivot lab** (proxy 0.9.1 in a container,
+  operator → pivot1 → listener → pivot2 → target):
+  - `ligolo_tunnel_start` on an agent whose tunnel is already running on
+    another interface is refused, and a repeat on the same interface is an
+    `already_running` no-op. ligolo leaves the new TUN orphaned: after the next
+    stop, the device stays held (`tun.New device or resource busy`) until the
+    proxy restarts. Reproduced deliberately, twice.
+  - That `busy` error now explains the cause and the way out (fresh interface
+    name, or restart the proxy).
+  - Interface names Linux rejects (over 15 bytes, whitespace, `/`) are refused
+    by `ligolo_interface_create` and `ligolo_tunnel_start` before the proxy
+    registers them. The proxy accepts any string and leaves a pending interface
+    (`TUNSETIFF … invalid argument`).
+  - For a proxy this server did not start, `apiUrl` and `webui.url` reported
+    the planned listen address (`:8080`) instead of `LIGOLO_API`, sending the
+    human to the wrong port.
+
+### Changed
+
+- `ligolo_listener_delete` on a listener that is already gone returns
+  `already_absent: true` instead of an error, matching `ligolo_route_delete`.
+- An existing config with the UI off is refused under `LIGOLO_WEBUI=1` until
+  `rewriteConfig: true` (backup kept) or a manual edit.
+
 ## 1.4.0 — 2026-11-08
 
 Field report from a five-host, four-hop pivot driven entirely through this

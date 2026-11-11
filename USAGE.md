@@ -466,6 +466,34 @@ creates the device itself at `tunnel_start` when the binary holds
 `CAP_NET_ADMIN` (`setcap cap_net_admin=ep /opt/ligolo-ng/linux/proxy`), which is
 how a four-hop chain builds four interfaces without sudo.
 
+## Watching it in the browser
+
+With `LIGOLO_WEBUI=1` and `LIGOLO_WEBUI_PASSWORD` set in the server's env, the
+proxy serves its WebUI on the API port (README §Observer WebUI). The agent
+sees only where it is:
+
+```json
+{"tool": "ligolo_proxy_start", "arguments": {}}
+→ {"running": true, "apiUrl": "http://127.0.0.1:8080",
+   "webui": {"enabled": true, "url": "http://127.0.0.1:8080/",
+             "login": {"api_url": "http://127.0.0.1:8080", "user": "operator"}, "note": "…"}, …}
+```
+
+The human opens the URL and logs in. Anything they change shows up to the
+agents as `external`:
+
+```json
+{"tool": "ligolo_route_list", "arguments": {}}
+→ {"routes": [
+     {"interface": "ligolo", "destination": "10.10.10.0/24", "active": true, "origin": "mcp"},
+     {"interface": "ligolo", "destination": "10.9.9.0/24",   "active": true, "origin": "external"}],
+   "removed_outside_mcp": [{"kind": "route", "key": "ligolo 172.16.5.0/24", "created_at": "…"}]}
+```
+
+An agent should treat `external` state as the operator's — use it if it is in
+scope, but do not delete it unasked — and read `removed_outside_mcp` as "the
+operator took this away", not as a failure to retry.
+
 ## Raw API by hand
 
 Useful for debugging the MCP layer, scripting without an MCP client, or the

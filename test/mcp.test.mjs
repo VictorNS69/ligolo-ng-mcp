@@ -112,6 +112,9 @@ function makeApi() {
       if (url === "/api/v1/agents") return send(200, state.agents);
       if (url === "/api/v1/interfaces" && req.method === "GET") return send(200, state.interfaces);
       if (url === "/api/v1/interfaces" && req.method === "POST") {
+        if (parsed.Interface === "busyif") {
+          return send(500, { error: "Tuntap IOCTL TUNSETIFF failed [0], errno device or resource busy" });
+        }
         state.interfaces[parsed.Interface] = { Routes: [], Active: true };
         return send(200, { message: `Interface ${parsed.Interface} created.` });
       }
@@ -157,6 +160,9 @@ function makeApi() {
       }
       if (/^\/api\/v1\/tunnel\/\d+$/.test(url) && req.method === "POST") {
         state.calls.at(-1).body = parsed;
+        if (parsed.Interface === "heldtun") {
+          return send(500, { error: "unable to open tun interface 'heldtun' (tun.New device or resource busy)" });
+        }
         return send(200, { message: "tunnel starting" });
       }
       if (/^\/api\/v1\/tunnel\/\d+$/.test(url) && req.method === "DELETE") {
@@ -248,6 +254,7 @@ async function startServer({
   password = "testpass",
   mcpFlag = true,
   standaloneScope = "",
+  env: extraEnv = {},
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), "ligolo-mcp-"));
   const framework = makeFramework(join(root, "framework"), { deny });
@@ -298,6 +305,7 @@ async function startServer({
       LIGOLO_SCOPE: standaloneScope,
       LIGOLO_NG_DIR: "",
       LIGOLO_PROXY_BIN: "",
+      ...extraEnv,
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -308,6 +316,18 @@ async function startServer({
     await new Promise((r) => server.close(r));
   };
   return { client, state, tools, framework, cert, cleanup, workdir };
+}
+
+/**
+ * A process that looks like a proxy this server spawned: its argv carries
+ * `-config <configPath>`, which is how a manifest entry is told apart from an
+ * unrelated process that inherited a recycled pid.
+ */
+function standInProxy(configPath) {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", "-config", configPath], {
+    stdio: "ignore",
+  });
+  return child;
 }
 
 function mutatingCalls(state) {
@@ -736,11 +756,14 @@ describe("log placement", () => {
     const first = planInstance(cfg, {});
     // a live first instance, as the manifest would hold it
     mkdirSync(join(root, "ws"), { recursive: true });
+    const proxy1 = standInProxy(first.configPath);
+    await new Promise((r) => setTimeout(r, 200));
+    after(() => proxy1.kill("SIGKILL"));
     writeFileSync(
       join(root, "ws", ".ligolo-mcp-instances.json"),
       JSON.stringify({
         ligolo: {
-          name: "ligolo", index: 1, pid: process.pid,
+          name: "ligolo", index: 1, pid: proxy1.pid,
           apiUrl: "http://127.0.0.1:8080", proxyAddr: "0.0.0.0:11601",
           configPath: first.configPath, credsPath: first.credsPath, selfcertDir: first.selfcertDir,
           workspace: first.workspace, logPath: first.logPath, assessment: "test-assessment",
@@ -807,12 +830,14 @@ describe("instances", () => {
     const second = makeApi();
     await new Promise((r) => second.server.listen(0, "127.0.0.1", r));
     const port2 = second.server.address().port;
+    const proxy2 = standInProxy(join(h.workdir, "ligolo2", "ligolo-ng.yaml"));
+    await new Promise((r) => setTimeout(r, 200));
     try {
       const manifest = {
         ligolo2: {
           name: "ligolo2",
           index: 2,
-          pid: process.pid,
+          pid: proxy2.pid,
           apiUrl: `http://127.0.0.1:${port2}`,
           proxyAddr: "0.0.0.0:11602",
           configPath: join(h.workdir, "ligolo2", "ligolo-ng.yaml"),
@@ -838,6 +863,7 @@ describe("instances", () => {
       await h.client.call("ligolo_route_list");
       assert.equal(h.state.calls.length, 1, "omitting instance uses the default proxy");
     } finally {
+      proxy2.kill("SIGKILL");
       await new Promise((r) => second.server.close(r));
       await h.cleanup();
     }
@@ -1072,5 +1098,379 @@ describe("argument validation and proxy error mapping", () => {
     } finally {
       await h.cleanup();
     }
+  });
+});
+
+describe("observer WebUI", () => {
+  const mkCfg = async (root, extra = {}) => {
+    const { loadConfig } = await import("../dist/ligolo.js");
+    return loadConfig(
+      {
+        LIGOLO_PROXY_CONFIG: join(root, "ligolo-ng.yaml"),
+        LIGOLO_SELFCERT_DIR: join(root, "ligolo-selfcerts"),
+        LIGOLO_USER: "ligolo",
+        LIGOLO_PASSWORD: "agentpw",
+        LIGOLO_BITORIA_ROOT: "",
+        LIGOLO_ASSESSMENT: "",
+        LIGOLO_WEBUI: "1",
+        LIGOLO_WEBUI_PASSWORD: "human-secret-pw",
+        ...extra,
+      },
+      root,
+    );
+  };
+
+  it("is off by default and seeds enableui: false with a single user", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ligolo-ui0-"));
+    const cfg = await mkCfg(root, { LIGOLO_WEBUI: "" });
+    const { seedConfig, planInstance, webUiState } = await import("../dist/proxy.js");
+    const spec = planInstance(cfg, {});
+    seedConfig(cfg, spec, false);
+    const yaml = readFileSync(spec.configPath, "utf8");
+    assert.match(yaml, /enableui: false/);
+    assert.doesNotMatch(yaml, /operator:/);
+    assert.doesNotMatch(yaml, /corsallowedorigin/);
+    assert.deepEqual(webUiState(cfg, spec.configPath, spec.apiUrl), { enabled: false });
+  });
+
+  it("seeds the UI on the API listener with a separate human user, never in the creds file", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ligolo-ui1-"));
+    const cfg = await mkCfg(root);
+    const { seedConfig, planInstance, webUiState, assertWebUiAllowed } = await import("../dist/proxy.js");
+    const spec = planInstance(cfg, {});
+    assertWebUiAllowed(cfg, spec.apiUrl);
+    seedConfig(cfg, spec, false);
+    const yaml = readFileSync(spec.configPath, "utf8");
+    assert.match(yaml, /enableui: true/);
+    assert.match(yaml, /corsallowedorigin:\n {4}- "http:\/\/127\.0\.0\.1:8080"/);
+    assert.match(yaml, /ligolo: "agentpw"/);
+    assert.match(yaml, /operator: "human-secret-pw"/);
+    assert.equal(statSync(spec.configPath).mode & 0o777, 0o600);
+    const creds = readFileSync(spec.credsPath, "utf8");
+    assert.doesNotMatch(creds, /human-secret-pw/, "the human password must not land where the agent's creds live");
+    assert.doesNotMatch(creds, /operator/);
+    const state = webUiState(cfg, spec.configPath, spec.apiUrl);
+    assert.equal(state.enabled, true);
+    assert.equal(state.url, "http://127.0.0.1:8080/");
+    assert.deepEqual(state.login, { api_url: "http://127.0.0.1:8080", user: "operator" });
+    assert.match(state.note, /NOT read-only/);
+    assert.doesNotMatch(JSON.stringify(state), /human-secret-pw/, "tool output must never carry the human password");
+  });
+
+  it("refuses a non-loopback listener, a missing password and a shared user, all at once", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ligolo-ui2-"));
+    const cfg = await mkCfg(root, {
+      LIGOLO_API_LISTEN: "0.0.0.0:8080",
+      LIGOLO_WEBUI_PASSWORD: "",
+      LIGOLO_WEBUI_USER: "ligolo",
+    });
+    const { planInstance, assertWebUiAllowed } = await import("../dist/proxy.js");
+    const spec = planInstance(cfg, {});
+    assert.throws(
+      () => assertWebUiAllowed(cfg, spec.apiUrl),
+      (err) =>
+        /not loopback/.test(err.message) &&
+        /LIGOLO_WEBUI_PASSWORD is not set/.test(err.message) &&
+        /same as the MCP's API user/.test(err.message) &&
+        /Nothing was started/.test(err.message),
+    );
+    assert.equal(existsSync(spec.configPath), false, "a refused request writes nothing");
+  });
+
+  it("accepts every loopback spelling", async () => {
+    const { isLoopback, listenHost } = await import("../dist/ligolo.js");
+    for (const addr of ["127.0.0.1:8080", "127.10.0.3:9", "localhost:8080", "[::1]:8080", "http://127.0.0.1:8080"]) {
+      assert.equal(isLoopback(listenHost(addr)), true, addr);
+    }
+    for (const addr of ["0.0.0.0:8080", "10.0.0.5:8080", "[::]:8080", "192.168.1.2:80"]) {
+      assert.equal(isLoopback(listenHost(addr)), false, addr);
+    }
+  });
+
+  it("will not silently reuse an existing config that has the UI off", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ligolo-ui3-"));
+    const off = await mkCfg(root, { LIGOLO_WEBUI: "" });
+    const { seedConfig, planInstance } = await import("../dist/proxy.js");
+    seedConfig(off, planInstance(off, {}), false);
+    const on = await mkCfg(root);
+    assert.throws(
+      () => seedConfig(on, planInstance(on, {}), false),
+      /web\.enableui off and has no web\.users entry for operator.*rewriteConfig: true/,
+    );
+    const rewritten = seedConfig(on, planInstance(on, {}), true);
+    assert.equal(rewritten.created, true);
+    assert.ok(rewritten.backup && existsSync(rewritten.backup), "original kept as .bak");
+    assert.match(readFileSync(rewritten.path, "utf8"), /enableui: true/);
+  });
+
+  it("reports the UI as off over MCP when nothing enabled it", async () => {
+    const h = await startServer();
+    try {
+      const { payload } = await h.client.call("ligolo_proxy_status");
+      assert.deepEqual(payload.webui, { enabled: false });
+    } finally {
+      await h.cleanup();
+    }
+  });
+});
+
+describe("changes made outside the MCP", () => {
+  const scoped = { standaloneScope: "10.0.0.0/8,172.16.0.0/12", assessment: "" };
+
+  it("labels routes by origin and reports MCP routes removed elsewhere", async () => {
+    const h = await startServer(scoped);
+    try {
+      let r = await h.client.call("ligolo_route_add", { network: "172.16.5.0/24", target: "172.16.5.9", confirmed: true });
+      assert.equal(r.isError, false, JSON.stringify(r.payload));
+      // a human adds one in the WebUI
+      h.state.interfaces.ligolo.Routes.push({ Destination: "10.9.9.0/24", Active: true });
+      h.state.interfaces.ligolo.Routes.push({ Destination: "fe80::/64", Active: true });
+      r = await h.client.call("ligolo_route_list");
+      const byDest = Object.fromEntries(r.payload.routes.map((x) => [x.destination, x.origin]));
+      assert.deepEqual(byDest, { "172.16.5.0/24": "mcp", "10.9.9.0/24": "external", "fe80::/64": "proxy" });
+
+      const status = await h.client.call("ligolo_proxy_status");
+      const ext = status.payload.outside_mcp.external;
+      assert.ok(ext.some((e) => e.kind === "route" && e.destination === "10.9.9.0/24"));
+      assert.ok(ext.some((e) => e.kind === "interface" && e.interface === "ligolo"), "interface was not made via MCP");
+      assert.ok(!ext.some((e) => e.destination === "172.16.5.0/24"));
+      assert.ok(!ext.some((e) => e.destination === "fe80::/64"), "proxy link-local routes are nobody's change");
+
+      // the human then removes the MCP's route
+      h.state.interfaces.ligolo.Routes = h.state.interfaces.ligolo.Routes.filter((x) => x.Destination !== "172.16.5.0/24");
+      r = await h.client.call("ligolo_route_list");
+      assert.deepEqual(r.payload.removed_outside_mcp.map((e) => e.key), ["ligolo 172.16.5.0/24"]);
+      // reported until the MCP acts on it, not just once
+      r = await h.client.call("ligolo_proxy_status");
+      assert.deepEqual(r.payload.outside_mcp.removed_outside_mcp.map((e) => e.key), ["ligolo 172.16.5.0/24"]);
+      await h.client.call("ligolo_route_delete", { network: "172.16.5.0/24" });
+      r = await h.client.call("ligolo_route_list");
+      assert.equal(r.payload.removed_outside_mcp, undefined);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("labels tunnels by agent session and ignores agents that simply disconnected", async () => {
+    const h = await startServer(scoped);
+    try {
+      const r = await h.client.call("ligolo_tunnel_start", { agentId: "1", target: "10.0.0.5", confirmed: true });
+      assert.equal(r.isError, false, JSON.stringify(r.payload));
+      h.state.agents[1].Running = true;
+      h.state.agents[2] = { ...h.state.agents[1], Name: "other@host", SessionID: "zzz999", Running: true };
+      let list = await h.client.call("ligolo_agents_list");
+      const origin = Object.fromEntries(list.payload.agents.map((a) => [a.session_id, a.tunnel_origin]));
+      assert.deepEqual(origin, { abc123: "mcp", zzz999: "external" });
+
+      // stopped from the WebUI while the agent stays connected
+      h.state.agents[1].Running = false;
+      list = await h.client.call("ligolo_agents_list");
+      assert.deepEqual(list.payload.tunnels_stopped_outside_mcp.map((e) => e.key), ["abc123"]);
+
+      // the agent disconnects: normal life, not drift
+      delete h.state.agents[1];
+      const status = await h.client.call("ligolo_proxy_status");
+      assert.ok(!status.payload.outside_mcp.removed_outside_mcp.some((e) => e.kind === "tunnel"));
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("labels listeners and treats one deleted in the UI as already absent", async () => {
+    const h = await startServer(scoped);
+    try {
+      const r = await h.client.call("ligolo_listener_add", {
+        agentId: "1", localAddress: "0.0.0.0:4444", remoteAddress: "127.0.0.1:4444", target: "10.0.0.5", confirmed: true,
+      });
+      assert.equal(r.isError, false, JSON.stringify(r.payload));
+      h.state.listeners.push({ ...h.state.listeners[0], ListenerID: 7, ListenerAddr: "0.0.0.0:8000", RedirectAddr: "127.0.0.1:80" });
+      let list = await h.client.call("ligolo_listener_list");
+      assert.deepEqual(list.payload.listeners.map((l) => [l.ListenerID, l.origin]), [[0, "mcp"], [7, "external"]]);
+
+      h.state.listeners = h.state.listeners.filter((l) => l.ListenerID !== 0);
+      list = await h.client.call("ligolo_listener_list");
+      assert.equal(list.payload.removed_outside_mcp.length, 1);
+      const del = await h.client.call("ligolo_listener_delete", { listenerId: 0, agentId: "1" });
+      assert.equal(del.isError, false, JSON.stringify(del.payload));
+      assert.equal(del.payload.already_absent, true);
+      list = await h.client.call("ligolo_listener_list");
+      assert.equal(list.payload.removed_outside_mcp, undefined);
+    } finally {
+      await h.cleanup();
+    }
+  });
+});
+
+describe("regressions", () => {
+  it("refuses a mutating tool called by name in read-only mode, before the gate or the API", async () => {
+    const h = await startServer({ readOnly: true });
+    try {
+      const { isError, payload } = await h.client.call("ligolo_route_add", {
+        network: "10.1.1.0/24", target: "10.1.1.1", confirmed: true,
+      });
+      assert.equal(isError, true);
+      assert.match(payload.message, /not available: this server runs read-only/);
+      assert.deepEqual(mutatingCalls(h.state), []);
+      assert.equal(existsSync(join(h.framework, "scope_calls.log")), false, "the gate must not even run");
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("accepts apiPort on ligolo_proxy_start (it was read but undeclared, so always rejected)", async () => {
+    const h = await startServer();
+    try {
+      const { isError, payload } = await h.client.call("ligolo_proxy_start", { apiPort: "18099" });
+      assert.equal(isError, true);
+      assert.doesNotMatch(payload.message, /unknown argument/);
+      assert.match(payload.message, /proxy binary not found/);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("does not spawn a second proxy over one that already answers", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ligolo-foreign-"));
+    const marker = join(root, "spawned");
+    const fakeBin = join(root, "proxy");
+    writeFileSync(fakeBin, `#!/bin/sh\ntouch ${JSON.stringify(marker)}\nsleep 5\n`);
+    chmodSync(fakeBin, 0o755);
+    const probe = makeApi();
+    await new Promise((r) => probe.server.listen(0, "127.0.0.1", r));
+    const port = probe.server.address().port;
+    await new Promise((r) => probe.server.close(r));
+    const h = await startServer({ env: { LIGOLO_PROXY_BIN: fakeBin, LIGOLO_API_LISTEN: `127.0.0.1:${port}` } });
+    // a proxy this server did not start, already on the planned API port
+    const foreign = makeApi();
+    await new Promise((r) => foreign.server.listen(port, "127.0.0.1", r));
+    try {
+      const { isError, payload } = await h.client.call("ligolo_proxy_start");
+      assert.equal(isError, false, JSON.stringify(payload));
+      assert.equal(payload.managed, false);
+      assert.equal(payload.pid, null);
+      assert.match(payload.note, /not started by this server already answers/);
+      await new Promise((r) => setTimeout(r, 300));
+      assert.equal(existsSync(marker), false, "no proxy process may be spawned");
+    } finally {
+      await new Promise((r) => foreign.server.close(r));
+      await h.cleanup();
+    }
+  });
+
+  it("ignores a manifest pid that now belongs to an unrelated process, and never signals it", async () => {
+    const h = await startServer();
+    const bystander = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    await new Promise((r) => setTimeout(r, 200));
+    try {
+      writeFileSync(
+        join(h.workdir, ".ligolo-mcp-instances.json"),
+        JSON.stringify({
+          ligolo: {
+            name: "ligolo", index: 1, pid: bystander.pid, apiUrl: "http://127.0.0.1:1", proxyAddr: "0.0.0.0:11601",
+            configPath: join(h.workdir, "ligolo-ng.yaml"), credsPath: join(h.workdir, ".ligolo-mcp-credentials"),
+            selfcertDir: join(h.workdir, "ligolo-selfcerts"), workspace: h.workdir, logPath: join(h.workdir, "ligolo.log"),
+            assessment: "test-assessment", startedAt: new Date().toISOString(),
+          },
+        }),
+      );
+      const stop = await h.client.call("ligolo_proxy_stop");
+      assert.equal(stop.payload.signal, "not-running");
+      await new Promise((r) => setTimeout(r, 300));
+      assert.equal(bystander.exitCode, null, "the unrelated process must still be alive");
+      assert.equal(bystander.signalCode, null);
+    } finally {
+      bystander.kill("SIGKILL");
+      await h.cleanup();
+    }
+  });
+
+  it("explains a TUN device left behind by an earlier proxy", async () => {
+    const h = await startServer();
+    try {
+      const { isError, payload } = await h.client.call("ligolo_interface_create", { name: "busyif" });
+      assert.equal(isError, true);
+      assert.match(payload.message, /TUN device named busyif already exists/);
+      assert.match(payload.message, /ip link delete busyif/);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("reports the URL it talks to for a proxy it did not start (webui.url included)", async () => {
+    const h = await startServer();
+    try {
+      writeFileSync(
+        join(h.workdir, "ligolo-ng.yaml"),
+        "web:\n  enabled: true\n  enableui: true\n  listen: 0.0.0.0:8080\n  users:\n    ligolo: x\n    operator: y\n",
+      );
+      const { payload } = await h.client.call("ligolo_proxy_status");
+      const api = payload.apiUrl;
+      assert.match(api, /^http:\/\/127\.0\.0\.1:\d+$/);
+      assert.notEqual(api, "http://127.0.0.1:8080", "must be LIGOLO_API, not the planned listen address");
+      assert.equal(payload.webui.url, `${api}/`);
+      assert.equal(payload.webui.login.api_url, api);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("refuses an interface name Linux rejects, before the proxy registers it", async () => {
+    const h = await startServer({ standaloneScope: "10.0.0.0/8", assessment: "" });
+    try {
+      for (const [tool, args] of [
+        ["ligolo_interface_create", { name: "test desde ui" }],
+        ["ligolo_interface_create", { name: "a-name-way-too-long" }],
+        ["ligolo_tunnel_start", { agentId: "1", tun: "bad/name", target: "10.0.0.5", confirmed: true }],
+      ]) {
+        const { isError, payload } = await h.client.call(tool, args);
+        assert.equal(isError, true, tool);
+        assert.match(payload.message, /not a valid Linux interface name/);
+      }
+      assert.deepEqual(mutatingCalls(h.state), []);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("never moves a running tunnel to another interface (ligolo orphans the TUN)", async () => {
+    const h = await startServer({ standaloneScope: "10.0.0.0/8", assessment: "" });
+    try {
+      h.state.agents[1].Running = true;
+      h.state.agents[1].Interface = "ligolo";
+      const moved = await h.client.call("ligolo_tunnel_start", { agentId: "1", tun: "ligolo2", target: "10.0.0.5", confirmed: true });
+      assert.equal(moved.isError, true);
+      assert.match(moved.payload.message, /already runs a tunnel on ligolo.*Stop it first/);
+      const same = await h.client.call("ligolo_tunnel_start", { agentId: "1", tun: "ligolo", target: "10.0.0.5", confirmed: true });
+      assert.equal(same.isError, false, JSON.stringify(same.payload));
+      assert.equal(same.payload.already_running, true);
+      assert.deepEqual(mutatingCalls(h.state), [], "neither call may reach the proxy");
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("explains a TUN the proxy itself still holds", async () => {
+    const h = await startServer({ standaloneScope: "10.0.0.0/8", assessment: "" });
+    try {
+      const { isError, payload } = await h.client.call("ligolo_tunnel_start", { agentId: "1", tun: "heldtun", target: "10.0.0.5", confirmed: true });
+      assert.equal(isError, true);
+      assert.match(payload.message, /the proxy still holds heldtun.*fresh interface name/);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("derives the default API URL from LIGOLO_API_LISTEN", async () => {
+    const { loadConfig } = await import("../dist/ligolo.js");
+    const base = { LIGOLO_BITORIA_ROOT: "", LIGOLO_ASSESSMENT: "" };
+    assert.equal(loadConfig({ ...base }, process.cwd()).apiUrl, "http://127.0.0.1:8080");
+    assert.equal(loadConfig({ ...base, LIGOLO_API_LISTEN: "127.0.0.1:9090" }, process.cwd()).apiUrl, "http://127.0.0.1:9090");
+    assert.equal(loadConfig({ ...base, LIGOLO_API_LISTEN: "0.0.0.0:9090" }, process.cwd()).apiUrl, "http://127.0.0.1:9090");
+    assert.equal(loadConfig({ ...base, LIGOLO_API_LISTEN: "[::1]:9090" }, process.cwd()).apiUrl, "http://[::1]:9090");
+    assert.equal(
+      loadConfig({ ...base, LIGOLO_API_LISTEN: "127.0.0.1:9090", LIGOLO_API: "http://127.0.0.1:7000/" }, process.cwd()).apiUrl,
+      "http://127.0.0.1:7000",
+      "an explicit LIGOLO_API still wins",
+    );
   });
 });

@@ -63,6 +63,16 @@ export interface Config {
    * which makes mutating tools refuse — the server still works read-only.
    */
   standaloneScope: string[];
+  /**
+   * Observer WebUI (`LIGOLO_WEBUI=1`): the proxy also serves its browser UI on
+   * the API listener, for a *human* to watch what the agents do. Off by default.
+   * The human gets their own `web.users` entry so the agent's credential is
+   * never handed out, and the human's password is never written anywhere this
+   * server reads back or returns.
+   */
+  webUi: boolean;
+  webUiUser: string;
+  webUiPassword: string;
 }
 
 function envStr(env: NodeJS.ProcessEnv, key: string, fallback: string): string {
@@ -168,8 +178,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, cwd: string = p
   const credsPath = join(dirname(proxyConfig), ".ligolo-mcp-credentials");
   const creds = readCreds(credsPath);
   const assessment = resolveAssessment(root, envStr(env, "LIGOLO_ASSESSMENT", ""));
+  const apiListen = envStr(env, "LIGOLO_API_LISTEN", "127.0.0.1:8080");
+  // Without an explicit LIGOLO_API, talk to where the proxy is told to listen.
+  // A fixed :8080 default meant LIGOLO_API_LISTEN=127.0.0.1:9090 alone started
+  // the proxy on 9090 while status and every unmanaged call probed 8080.
+  const listenHostPart = listenHost(apiListen);
+  const reachableHost = /^(0\.0\.0\.0|::|)$/.test(listenHostPart) ? "127.0.0.1" : listenHostPart;
+  const defaultApi = `http://${reachableHost.includes(":") ? `[${reachableHost}]` : reachableHost}:${apiListen.slice(apiListen.lastIndexOf(":") + 1)}`;
   return {
-    apiUrl: envStr(env, "LIGOLO_API", "http://127.0.0.1:8080").replace(/\/+$/, ""),
+    apiUrl: envStr(env, "LIGOLO_API", defaultApi).replace(/\/+$/, ""),
     user: envStr(env, "LIGOLO_USER", creds.user ?? "ligolo"),
     password: envStr(env, "LIGOLO_PASSWORD", creds.password ?? ""),
     token: envStr(env, "LIGOLO_TOKEN", ""),
@@ -179,7 +196,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, cwd: string = p
     proxyBin: resolveProxyBin(env),
     proxyConfig,
     proxyAddr: envStr(env, "LIGOLO_PROXY_ADDR", "0.0.0.0:11601"),
-    apiListen: envStr(env, "LIGOLO_API_LISTEN", "127.0.0.1:8080"),
+    apiListen,
     // An expired or invalid marker names an assessment, but it does not
     // *authorize* one: the filesystem guard treats it as development mode, and
     // so must the gate. Keep the name out of `assessment` so a stale marker
@@ -194,7 +211,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, cwd: string = p
       .split(",")
       .map((v) => v.trim())
       .filter((v) => v !== ""),
+    webUi: /^(1|true|yes|on)$/i.test(envStr(env, "LIGOLO_WEBUI", "")),
+    webUiUser: envStr(env, "LIGOLO_WEBUI_USER", "operator"),
+    webUiPassword: envStr(env, "LIGOLO_WEBUI_PASSWORD", ""),
   };
+}
+
+/** Host part of a `host:port` listen address, brackets stripped. */
+export function listenHost(addr: string): string {
+  const bare = addr.replace(/^https?:\/\//, "");
+  const host = bare.includes(":") ? bare.slice(0, bare.lastIndexOf(":")) : bare;
+  return host.replace(/^\[|\]$/g, "");
+}
+
+/** True for 127.0.0.0/8, ::1 and localhost — the only places the WebUI may listen. */
+export function isLoopback(host: string): boolean {
+  const h = host.toLowerCase();
+  return h === "localhost" || h === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
 }
 
 /** A gate refusal is a first-class outcome, not a generic failure. */
@@ -534,8 +567,27 @@ export class LigoloApi {
     return this.call("GET", "/api/v1/listeners");
   }
 
-  createInterface(name: string): Promise<{ message: string }> {
-    return this.call("POST", "/api/v1/interfaces", { Interface: name });
+  /**
+   * With CAP_NET_ADMIN the proxy creates a real kernel TUN, and that device
+   * outlives the proxy. A later proxy with a fresh config then fails with
+   * "Tuntap IOCTL TUNSETIFF failed [0], errno device or resource busy", which
+   * names neither the cause nor the fix. (Seen against proxy 0.9.1.)
+   */
+  async createInterface(name: string): Promise<{ message: string }> {
+    try {
+      return await this.call("POST", "/api/v1/interfaces", { Interface: name });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/TUNSETIFF/i.test(msg) && /busy/i.test(msg)) {
+        throw new Error(
+          `${msg} — a TUN device named ${name} already exists on this host, usually left by an earlier proxy ` +
+            `(kernel TUNs outlive the process). Check with \`ip -d link show ${name}\`; remove it with ` +
+            `\`sudo ip link delete ${name}\`, or pick another interface name. Teardown with deleteInterface: true ` +
+            "removes it while the proxy that knows it is still running.",
+        );
+      }
+      throw err;
+    }
   }
 
   deleteInterface(name: string): Promise<{ message: string }> {
@@ -564,8 +616,25 @@ export class LigoloApi {
     }
   }
 
-  startTunnel(agentId: string, iface: string): Promise<{ message: string }> {
-    return this.call("POST", `/api/v1/tunnel/${encodeURIComponent(agentId)}`, { Interface: iface });
+  /**
+   * "tun.New device or resource busy" means the proxy itself still holds the
+   * device — typically a tunnel orphaned when a running tunnel was started on
+   * another interface (ligolo 0.9.x). Only a proxy restart releases it.
+   */
+  async startTunnel(agentId: string, iface: string): Promise<{ message: string }> {
+    try {
+      return await this.call("POST", `/api/v1/tunnel/${encodeURIComponent(agentId)}`, { Interface: iface });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/tun\.New/i.test(msg) && /busy/i.test(msg)) {
+        throw new Error(
+          `${msg} — the proxy still holds ${iface}, usually from a tunnel orphaned when a running tunnel was ` +
+            "started on another interface. Only a proxy restart frees it: use a fresh interface name now " +
+            "(and move its routes there), or restart the proxy when convenient.",
+        );
+      }
+      throw err;
+    }
   }
 
   stopTunnel(agentId: string): Promise<{ message: string }> {

@@ -49,3 +49,5 @@ ligolo-selfcerts/
 ligolo-proxy.log
 .ligolo-mcp-credentials
 .ligolo-mcp-proxy.pid
+.ligolo-mcp-instances.json
+.ligolo-mcp-ledger.json

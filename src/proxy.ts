@@ -347,8 +347,11 @@ export function instanceConfig(cfg: Config, entry: InstanceEntry): Config {
     proxyConfig: entry.configPath,
     credsPath: entry.credsPath,
     selfcertDir: entry.selfcertDir,
-    password: creds.password ?? cfg.password,
-    user: creds.user ?? cfg.user,
+    // LIGOLO_PASSWORD / LIGOLO_USER, when set, win over the credentials file —
+    // as documented. The file used to win, so an operator who changed the
+    // password in the environment kept authenticating with the stale one.
+    password: cfg.passwordFromEnv ? cfg.password : (creds.password ?? cfg.password),
+    user: cfg.userFromEnv ? cfg.user : (creds.user ?? cfg.user),
   };
 }
 

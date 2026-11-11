@@ -4,6 +4,28 @@ Fork of [`schwarztim/sec-ligolo-ng-mcp`](https://github.com/schwarztim/sec-ligol
 (MIT). Versions below are this fork's; `1.0.0` is the upstream initial release it
 started from.
 
+## 1.5.1 — 2026-11-11
+
+### Fixed
+
+- **`LIGOLO_PASSWORD` / `LIGOLO_USER` now win over `.ligolo-mcp-credentials`**
+  for every instance, as the README always said. The credentials file used to
+  win once an instance was running, so a password changed in the environment
+  was silently ignored. Without the environment variables, each instance still
+  uses its own credentials file.
+- **`ligolo_teardown` now removes IPv6 routes.** It skipped every destination
+  containing `:`, so an IPv6 route added through the MCP survived teardown. It
+  now skips only ligolo's own `fe80::/64` link-local routes, which the proxy
+  adds on each tunnel start (two of them after a restart, seen in the lab).
+
+### Documentation
+
+- README rewritten around `LIGOLO_SCOPE` as the authorization: the server is
+  self-contained and needs no external framework. Stale details fixed
+  (`ligolo-proxy.log` and the pid file no longer exist; logs are
+  `<workspace>/ligolo[<n>].log`), credential precedence spelled out, including
+  the `401` after changing a password on an existing config.
+
 ## 1.5.0 — 2026-11-11
 
 ### Added
@@ -64,11 +86,6 @@ started from.
   - For a proxy this server did not start, `apiUrl` and `webui.url` reported
     the planned listen address (`:8080`) instead of `LIGOLO_API`, sending the
     human to the wrong port.
-
-- **`ligolo_teardown` now removes IPv6 routes.** It skipped every destination
-  containing `:`, so an IPv6 route added through the MCP survived teardown. It
-  now skips only ligolo's own `fe80::/64` link-local routes, which the proxy
-  adds on each tunnel start (two of them after a restart, seen in the lab).
 
 ### Changed
 

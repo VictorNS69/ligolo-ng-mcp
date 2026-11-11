@@ -296,7 +296,7 @@ const writeTools: Tool[] = [
   },
   {
     name: "ligolo_proxy_stop",
-    description: "Stop the proxy process started by ligolo_proxy_start (SIGTERM via its pid file). Does not touch agents.",
+    description: "Stop the proxy process started by ligolo_proxy_start (SIGTERM to its recorded, verified pid). Does not touch agents.",
     inputSchema: { type: "object" as const, properties: { instance: INSTANCE }, required: [] },
     annotations: { readOnlyHint: false, destructiveHint: true },
   },
@@ -430,7 +430,7 @@ const writeTools: Tool[] = [
 ];
 
 /** Single source for the version reported over MCP and in the startup banner. */
-const VERSION = "1.5.0";
+const VERSION = "1.5.1";
 
 const tools: Tool[] = cfg.readOnly ? readTools : [...readTools, ...writeTools];
 

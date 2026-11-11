@@ -33,6 +33,13 @@ export interface Config {
   /** API credentials (argon2id hashes live in the proxy config; these are plaintext for /api/auth). */
   user: string;
   password: string;
+  /**
+   * True when LIGOLO_USER / LIGOLO_PASSWORD came from the environment. An
+   * explicit environment value wins over `.ligolo-mcp-credentials` for every
+   * instance; without it, each instance uses its own credentials file.
+   */
+  userFromEnv: boolean;
+  passwordFromEnv: boolean;
   /** Pre-minted JWT instead of user/password (optional). */
   token: string;
   /** Default TUN interface name used by tunnel/route tools. */
@@ -189,6 +196,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, cwd: string = p
     apiUrl: envStr(env, "LIGOLO_API", defaultApi).replace(/\/+$/, ""),
     user: envStr(env, "LIGOLO_USER", creds.user ?? "ligolo"),
     password: envStr(env, "LIGOLO_PASSWORD", creds.password ?? ""),
+    userFromEnv: envStr(env, "LIGOLO_USER", "") !== "",
+    passwordFromEnv: envStr(env, "LIGOLO_PASSWORD", "") !== "",
     token: envStr(env, "LIGOLO_TOKEN", ""),
     interfaceName: envStr(env, "LIGOLO_INTERFACE", "ligolo"),
     selfcertDir,

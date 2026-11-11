@@ -1497,3 +1497,41 @@ describe("regressions", () => {
     );
   });
 });
+
+describe("credential precedence", () => {
+  const entryFor = (root) => ({
+    name: "ligolo", index: 1, pid: 1, apiUrl: "http://127.0.0.1:8080", proxyAddr: "0.0.0.0:11601",
+    configPath: join(root, "ligolo-ng.yaml"), credsPath: join(root, ".ligolo-mcp-credentials"),
+    selfcertDir: join(root, "ligolo-selfcerts"), workspace: root, logPath: join(root, "ligolo.log"),
+    assessment: "", startedAt: new Date().toISOString(),
+  });
+
+  it("LIGOLO_PASSWORD and LIGOLO_USER win over .ligolo-mcp-credentials", async () => {
+    const { loadConfig } = await import("../dist/ligolo.js");
+    const { instanceConfig } = await import("../dist/proxy.js");
+    const root = mkdtempSync(join(tmpdir(), "ligolo-prec1-"));
+    writeFileSync(join(root, ".ligolo-mcp-credentials"), JSON.stringify({ user: "fileuser", password: "filepw" }));
+    const cfg = loadConfig(
+      { LIGOLO_PROXY_CONFIG: join(root, "ligolo-ng.yaml"), LIGOLO_USER: "envuser", LIGOLO_PASSWORD: "envpw", LIGOLO_BITORIA_ROOT: "" },
+      root,
+    );
+    assert.equal(cfg.password, "envpw");
+    const scoped = instanceConfig(cfg, entryFor(root));
+    assert.equal(scoped.password, "envpw", "the environment must win for a running instance too");
+    assert.equal(scoped.user, "envuser");
+  });
+
+  it("falls back to the instance's credentials file when the environment is silent", async () => {
+    const { loadConfig } = await import("../dist/ligolo.js");
+    const { instanceConfig } = await import("../dist/proxy.js");
+    const root = mkdtempSync(join(tmpdir(), "ligolo-prec2-"));
+    writeFileSync(join(root, ".ligolo-mcp-credentials"), JSON.stringify({ user: "fileuser", password: "filepw" }));
+    const cfg = loadConfig(
+      { LIGOLO_PROXY_CONFIG: join(root, "ligolo-ng.yaml"), LIGOLO_USER: "", LIGOLO_PASSWORD: "", LIGOLO_BITORIA_ROOT: "" },
+      root,
+    );
+    const scoped = instanceConfig(cfg, entryFor(root));
+    assert.equal(scoped.password, "filepw");
+    assert.equal(scoped.user, "fileuser");
+  });
+});

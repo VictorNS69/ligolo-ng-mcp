@@ -7,17 +7,16 @@ movement in authorized security assessments.
 Every tool is a call against the ligolo **proxy's authenticated REST control
 plane**. No SSH, no tmux, no scraping the readline console.
 
-When an engagement enables this server (`ligolo.mcp: true` in a BITORIA
-`scope.yaml`, or `LIGOLO_SCOPE` standalone), **these tools are the primary pivot
-path** — the console wrapper and SOCKS fallbacks (chisel) are what you use when
-this server is disabled or cannot run. The gate enforces the enablement, so
-"enabled" is a real state rather than a convention.
+It is self-contained: Node.js and a ligolo-ng release are all it needs. You
+declare what you are authorized to reach in `LIGOLO_SCOPE`, and every call that
+makes something newly reachable must name a target inside it and carry an
+explicit `confirmed: true`.
 
 ```
 MCP client ──stdio──> ligolo-ng-mcp ──HTTP /api/v1──> ligolo proxy ──TLS──> agent
                             │
-                            ├─ scripts/common/scope_check.py  (lateral checkpoint, before any HTTP call)
-                            └─ scripts/common/log_command.sh  (audit trail per call)
+                            └─ lateral-movement gate: target ∈ LIGOLO_SCOPE + confirmed
+                               (checked before any HTTP request leaves the process)
 ```
 
 > [!WARNING]
@@ -48,7 +47,7 @@ MCP client ──stdio──> ligolo-ng-mcp ──HTTP /api/v1──> ligolo pro
 **Operational walkthrough with request/response examples: [USAGE.md](USAGE.md).**
 
 Contents: [Why this fork](#why-this-fork) · [Requirements](#requirements) ·
-[Install](#install) · [Configuration](#configuration) · [Typical
+[Install](#install) · [Quick start](#quick-start) · [Configuration](#configuration) · [Typical
 flow](#typical-flow) · [Usage](USAGE.md) · [Logs](#logs) ·
 [Multiple instances](#multiple-instances) · [Observer WebUI](#observer-webui) ·
 [The lateral-movement gate](#the-lateral-movement-gate) · [Tools](#tools) ·
@@ -95,9 +94,8 @@ the full list is in [Breaking changes](#breaking-changes). See
   `LIGOLO_NG_DIR` at the directory holding `proxy`, or set `LIGOLO_PROXY_BIN`.
 - privileges to create a TUN interface for the proxy (the agent needs none —
   it uses a userland gVisor stack)
-- to use the checkpoint gate: a framework checkout providing
-  `scripts/common/scope_check.py` (BITORIA). Without it the mutating tools
-  refuse to run — by design.
+
+Nothing else: no Python, no shell wrappers, no external framework.
 
 ## Install
 
@@ -108,6 +106,18 @@ npm install
 npm run build
 ```
 
+## Quick start
+
+```bash
+export LIGOLO_NG_DIR=/opt/ligolo-ng                       # release binaries
+export LIGOLO_PROXY_CONFIG=$HOME/.ligolo/ligolo-ng.yaml   # workspace, outside the checkout
+export LIGOLO_SCOPE="10.10.10.0/24"                       # what you may pivot to
+node dist/index.js                                        # or register it in any MCP client
+```
+
+Without `LIGOLO_SCOPE` the server still runs, but only read-only tools succeed:
+mutating tools refuse until you say what you are authorized to reach.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -116,27 +126,30 @@ npm run build
 | `LIGOLO_PROXY_BIN` | — | explicit path to the proxy binary (wins over `LIGOLO_NG_DIR`) |
 | `LIGOLO_API` | derived from `LIGOLO_API_LISTEN` (`http://127.0.0.1:8080`) | proxy REST API base URL |
 | `LIGOLO_USER` | `ligolo` | API user (must match `web.users` in the proxy config) |
-| `LIGOLO_PASSWORD` | — | API password; if unset, `ligolo_proxy_start` generates one |
+| `LIGOLO_PASSWORD` | — | API password; if unset, `ligolo_proxy_start` generates one (see precedence below) |
 | `LIGOLO_TOKEN` | — | pre-minted JWT instead of user/password |
 | `LIGOLO_INTERFACE` | `ligolo` | default TUN interface name for tunnel/route/teardown |
 | `LIGOLO_PROXY_ADDR` | `0.0.0.0:11601` | agent-facing listen address |
 | `LIGOLO_API_LISTEN` | `127.0.0.1:8080` | API listen address written into a **newly seeded** config |
 | `LIGOLO_PROXY_CONFIG` | `./ligolo-ng.yaml` | proxy config path; keep it in a workspace, not a repo root |
 | `LIGOLO_SELFCERT_DIR` / `LIGOLO_SELFCERT_DOMAIN` | `./ligolo-selfcerts` / `ligolo` | where `-selfcert` caches its cert (fingerprint source) |
-| `LIGOLO_ASSESSMENT` | — | assessment name/path for the gate; when unset, the active-assessment marker is used |
-| `LIGOLO_BITORIA_ROOT` | auto-detected | framework checkout owning `scripts/common/scope_check.py` (walks up from cwd) |
 | `LIGOLO_MCP_READ_ONLY` | off | `1` registers only the 9 read-only tools |
 | `LIGOLO_WEBUI` | off | `1` also serves the proxy's WebUI on the (loopback) API listener for a **human observer** — see [Observer WebUI](#observer-webui) |
 | `LIGOLO_WEBUI_USER` | `operator` | the human's `web.users` entry; must differ from `LIGOLO_USER` |
 | `LIGOLO_WEBUI_PASSWORD` | — | the human's password; **required** with `LIGOLO_WEBUI=1`, never generated, never returned |
-| `LIGOLO_SCOPE` | — | **standalone authorization**: comma-separated hosts/CIDRs this server may pivot to when no BITORIA assessment is in play (see [Running outside BITORIA](#running-outside-bitoria)) |
-| `LIGOLO_ASSESSMENT` (effect) | — | when set/resolved, proxy logs go to `assessments/<name>/state/ligolo[<n>].log`; otherwise `<workspace>/ligolo[<n>].log` |
+| `LIGOLO_SCOPE` | — | **authorization**: comma-separated hosts/CIDRs this server may pivot to (see [The lateral-movement gate](#the-lateral-movement-gate)) |
 
-Precedence: an explicit environment value wins; otherwise
-`.ligolo-mcp-credentials` (written next to the proxy config) supplies
-`user`/`password`. Credentials generated by `ligolo_proxy_start` land in that
-file with mode `0600`, so registering the server never requires a secret in the
-client's config.
+**Credential precedence.** `LIGOLO_USER` / `LIGOLO_PASSWORD`, when set, win
+for every instance. When they are unset, each instance uses its own
+`.ligolo-mcp-credentials` (written next to its proxy config, mode `0600`): that
+is where `ligolo_proxy_start` stores a password it generated, so registering the
+server never requires a secret in the client's config.
+
+The password is only written into `web.users` when a config is **seeded**. If you
+set or change `LIGOLO_PASSWORD` after a config exists, the proxy still holds the
+old (hashed) one and the API answers `401`: re-seed with `ligolo_proxy_start
+{"rewriteConfig": true}` (the original is kept as `.bak`), or update `web.users`
+yourself.
 
 ### Registering it
 
@@ -156,10 +169,12 @@ client's config.
 }
 ```
 
-`LIGOLO_PROXY_CONFIG` must point outside the checkout: the proxy writes
-`ligolo-ng.yaml`, `ligolo-selfcerts/`, `ligolo-proxy.log` and
-`.ligolo-mcp-proxy.pid` beside it (all covered by `.gitignore` if you do run it
-from a clone).
+Add `"LIGOLO_SCOPE"` (and optionally `"LIGOLO_PASSWORD"`) to `env` the same way.
+
+`LIGOLO_PROXY_CONFIG` must point outside the checkout: the proxy and this server
+write `ligolo-ng.yaml`, `ligolo-selfcerts/`, `ligolo.log`,
+`.ligolo-mcp-credentials`, `.ligolo-mcp-instances.json` and
+`.ligolo-mcp-ledger.json` beside it.
 
 ## Typical flow
 
@@ -177,8 +192,8 @@ read-only mode and teardown discipline.
    `agent`/`agent.exe` command line. The port in that command is the proxy's
    configured listen port, including a `port` override from step 1 — one source
    of truth, so the agent cannot be pointed at a port the proxy is not on.
-   Upload the agent to the foothold (log it in `cleanup-pending.md` at upload
-   time) and run it.
+   Upload the agent to the foothold (note it for cleanup the moment it lands)
+   and run it.
 4. `ligolo_agents_list` → `agent_id` + the agent's interfaces and addresses
    (this is the `ifconfig` step, as JSON).
 5. `ligolo_tunnel_start` `{ "agentId": "1", "tun": "ligolo", "target":
@@ -190,30 +205,24 @@ read-only mode and teardown discipline.
    connect both work; no SOCKS tax).
 7. `ligolo_listener_add` for reverse callbacks / payload serving.
 8. `ligolo_teardown` `{ "agentId": "1", "deleteInterface": true }` → listeners,
-   routes, tunnel, interface. Then delete the agent binary on the foothold and
-   resolve the `cleanup-pending.md` entries.
+   routes, tunnel, interface. Then delete the agent binary on the foothold — the
+   API cannot do that for you.
 
 ## Logs
 
-The proxy's stdout/stderr go to the **assessment's state tree**, because that is
-where engagement evidence belongs:
+The proxy's stdout/stderr go to the workspace (`dirname(LIGOLO_PROXY_CONFIG)`):
 
 | Instance | Log file |
 |---|---|
-| first (`ligolo`) | `assessments/<name>/state/ligolo.log` |
-| second (`ligolo2`) | `assessments/<name>/state/ligolo2.log` |
-| third (`ligolo3`) | `assessments/<name>/state/ligolo3.log` |
+| first (`ligolo`) | `<workspace>/ligolo.log` |
+| second (`ligolo2`) | `<workspace>/ligolo2.log` |
+| third (`ligolo3`) | `<workspace>/ligolo3.log` |
 
-Appended across restarts of the same instance, so the file accumulates the whole
-engagement's proxy history. With **no active assessment** there is no state tree
-to own it, so it falls back to `<workspace>/ligolo[<n>].log` (the workspace being
-`dirname(LIGOLO_PROXY_CONFIG)`).
-
-`ligolo_proxy_start` returns the resolved `logPath` and `ligolo_proxy_status`
-returns it per instance, so nothing has to be guessed. Two other streams exist
-and are *not* proxy logs: the MCP server's own diagnostics go to **stderr**
-(captured by the MCP client), and every tool call is appended to
-`<assessment>/logs/commands.log` through `log_command.sh`.
+Appended across restarts of the same instance, so the file accumulates the
+proxy's whole history. `ligolo_proxy_start` returns the resolved `logPath` and
+`ligolo_proxy_status` returns it per instance, so nothing has to be guessed. The
+MCP server's own diagnostics are a separate stream: they go to **stderr**
+(captured by the MCP client).
 
 Note the proxy also writes `<workspace>/ligolo-ng.yaml`, `ligolo-selfcerts/`
 (the fingerprint source) and a log for gin's HTTP layer only if `web.logfile` is
@@ -226,9 +235,9 @@ held by something else, or a segment that must not share routes with the first.
 Instance 1 is `ligolo`; each further instance is `ligolo2`, `ligolo3`, …
 
 ```
-ligolo_proxy_start                       → ligolo   api :8080  agent :11601  state/ligolo.log
-ligolo_proxy_start                       → ligolo2  api :8081  agent :11602  state/ligolo2.log
-ligolo_proxy_start {"instance":"ligolo3"} → ligolo3  api :8082  agent :11603  state/ligolo3.log
+ligolo_proxy_start                       → ligolo   api :8080  agent :11601  ligolo.log
+ligolo_proxy_start                       → ligolo2  api :8081  agent :11602  ligolo2.log
+ligolo_proxy_start {"instance":"ligolo3"} → ligolo3  api :8082  agent :11603  ligolo3.log
 ```
 
 Each instance gets its own API/agent ports (first free after the configured
@@ -246,9 +255,9 @@ every other tool takes an optional `instance` argument and defaults to `ligolo`:
 `ligolo_proxy_status` with no argument lists every live instance with its API
 URL and log path. Stopping is per instance (`ligolo_proxy_stop {"instance":
 "ligolo2"}`); a dead instance's manifest entry is pruned on the next start or
-status. If a proxy was started outside this server (by hand or by the console
-wrapper), status reports it as `managed: false` and the log path stays wherever
-that process put it.
+status. If a proxy was started outside this server (by hand, in a container, …),
+status reports it as `managed: false` with the URL it talks to (`LIGOLO_API`),
+and the log path stays wherever that process put it.
 
 ## Observer WebUI
 
@@ -295,7 +304,7 @@ What the server enforces, and why:
 ### Changes made in the UI
 
 **The WebUI is not read-only.** ligolo has no read-only role, so a route, tunnel
-or listener created there **bypasses the lateral checkpoint and the audit log**.
+or listener created there **bypasses the lateral checkpoint**.
 That is acceptable for an authorized human operator — the gate exists to bound
 the agents — but the agents must not be confused by it. The server therefore
 keeps a ledger of what it created (`<workspace>/.ligolo-mcp-ledger.json`, reset
@@ -331,65 +340,33 @@ the workspace or the MCP client's config.
 
 `ligolo_tunnel_start`, `ligolo_route_add` and `ligolo_listener_add` make
 something newly reachable, so each passes a gate **before** the HTTP request
-leaves the process. The gate has two modes and no off switch.
-
-### Framework mode (BITORIA assessment active)
-
-Two conditions, in order:
-
-1. The assessment opted in. `scope.yaml` must contain
-
-   ```yaml
-   ligolo:
-     mcp: true
-   ```
-
-   This is asked at assessment setup and is **off by default**, the same way the
-   Burp MCP block is — an engagement that never opted in keeps using the console
-   wrapper, and the MCP tools refuse with exit 4 rather than quietly working.
-2. `scripts/common/scope_check.py <target> --assessment <A> --technique lateral --checkpoint`
-   then runs the lateral hard checkpoint exactly as a wrapper would:
-
-| Outcome | What happens |
-|---|---|
-| exit 0 | the call proceeds and is appended to `<assessment>/logs/commands.log` |
-| exit 5 | `{"error":"checkpoint-denied","action_taken":false,"exit_code":5}` and **nothing** is sent to the proxy |
-| exit 4 / other | `{"error":"checkpoint-denied", …}` — no assessment, no framework root, or a bad target |
-
-Recovery for exit 5: record the pivot (foothold, destination, mechanism, ports)
-in `state/decisions.md`, obtain human approval, then re-call with `target` +
-`confirmed: true`.
-
-`target` is the in-scope host the action makes reachable. For a route wider than
-`/32` it is required explicitly — "visible in `ifconfig`" is not authorization.
-Cleanup tools (`*_delete`, `ligolo_teardown`, `ligolo_tunnel_stop`) are logged
-but not checkpointed: reversing a pivot is not a new reachability transition.
-
-With no `LIGOLO_ASSESSMENT`, the server reads `state/assessment-scope.json` —
-the same marker (and the same 12h TTL) the framework's filesystem guard uses. An
-**expired or invalid marker counts as no assessment**: a leftover file refuses
-the pivot instead of authorizing it.
-
-### Standalone mode (no BITORIA)
-
-The server does not require a framework. Set `LIGOLO_SCOPE` to the hosts/CIDRs
-you are authorized to reach:
+leaves the process. Set `LIGOLO_SCOPE` to the hosts/CIDRs you are authorized to
+reach:
 
 ```bash
 export LIGOLO_SCOPE="10.10.10.0/24,172.16.5.9"
 ```
 
-A reachability-changing call then needs a target inside that list **and**
-`confirmed: true`. Out-of-scope → exit 3, missing confirmation → exit 5. IPv4
-ranges are bit-compared; anything else is matched exactly.
+A reachability-changing call then needs a `target` inside that list **and**
+`confirmed: true`:
 
-### Neither configured
+| Outcome | What happens |
+|---|---|
+| target in scope + `confirmed: true` | the call proceeds |
+| target outside `LIGOLO_SCOPE` | `{"error":"checkpoint-denied","exit_code":3,"action_taken":false}`; **nothing** is sent to the proxy |
+| target in scope, no `confirmed` | `checkpoint-denied`, `exit_code: 5` — a human approves the pivot, then the call is repeated with `confirmed: true` |
+| `LIGOLO_SCOPE` unset | `checkpoint-denied`, `exit_code: 4` — no authorization configured |
 
-Mutating tools refuse with exit 4 and name both options; read-only tools
-(`agents_list`, `interface_list`, `route_list`, `listener_list`, fingerprints,
-`proxy_status`) keep working. There is deliberately no `--force`,
-`LIGOLO_GATE=off`, or "trust me" flag: a gate that can be switched off is not a
-gate.
+`target` is the in-scope host the action makes reachable. For a route wider than
+`/32` it is required explicitly — "visible in `ifconfig`" is not authorization.
+IPv4 ranges are bit-compared; anything else is matched exactly. Cleanup tools
+(`*_delete`, `ligolo_teardown`, `ligolo_tunnel_stop`) are not gated: reversing a
+pivot is not a new reachability transition.
+
+Read-only tools (`agents_list`, `interface_list`, `route_list`, `listener_list`,
+fingerprints, `proxy_status`) work with or without `LIGOLO_SCOPE`. There is
+deliberately no `--force`, `LIGOLO_GATE=off`, or "trust me" flag: a gate that can
+be switched off is not a gate.
 
 ## Tools
 
@@ -415,13 +392,13 @@ Mutating (10, hidden with `LIGOLO_MCP_READ_ONLY=1`):
 | Tool | Parameters | Gate |
 |---|---|---|
 | `ligolo_proxy_start` | `port?`, `apiPort?`, `rewriteConfig?`, `reuse?` | none — starts the proxy headless with a seeded loopback-API config |
-| `ligolo_proxy_stop` | — | none — SIGTERM via pid file |
+| `ligolo_proxy_stop` | — | none — SIGTERM to the instance's recorded (and verified) pid |
 | `ligolo_interface_create` | `name?` | none (local TUN only) |
 | `ligolo_tunnel_start` | `agentId`, `target`, `tun?`, `confirmed?` | **lateral checkpoint**; registers the interface first if missing; refuses to move an already running tunnel (ligolo would orphan the TUN) |
 | `ligolo_tunnel_stop` | `agentId` | none (cleanup) |
 | `ligolo_route_add` | `network`, `target?` (required unless `/32`), `interface?`, `confirmed?` | **lateral checkpoint** |
 | `ligolo_route_delete` | `network`, `interface?` | none (cleanup) |
-| `ligolo_listener_add` | `localAddress`, `remoteAddress`, `agentId`, `target`, `network?`, `confirmed?` | **lateral checkpoint**; also a resident artifact — record it in `cleanup-pending.md` |
+| `ligolo_listener_add` | `localAddress`, `remoteAddress`, `agentId`, `target`, `network?`, `confirmed?` | **lateral checkpoint**; also a resident artifact on the agent's host — track it for cleanup |
 | `ligolo_listener_delete` | `listenerId`, `agentId` | none (cleanup) |
 | `ligolo_teardown` | `agentId`, `interface?`, `deleteInterface?` | none (cleanup) — listeners → routes → tunnel → interface |
 
@@ -470,37 +447,17 @@ Versus upstream 1.0.0:
   it is always selfcert, always headless, always API-enabled. It gained `port`
   (agent-facing port override) and `rewriteConfig`.
 - Reachability-changing tools return `{"error":"checkpoint-denied"}` when no
-  assessment is active. Intentional, not a misconfiguration.
+  authorization is configured. Intentional, not a misconfiguration.
 - `ligolo_agent_command` pins the fingerprint and no longer defaults to
   `-ignore-cert`; `debugIgnoreCert: true` restores the old behaviour with a warning.
 - Errors are JSON (`isError: true`) instead of English prose.
-- 1.3.0: framework mode now also requires `ligolo.mcp: true` in the
-  assessment's `scope.yaml` (**off by default**); standalone use is supported via
-  `LIGOLO_SCOPE` (previously mutating tools refused without a framework at all).
+- 1.3.0: mutating tools are authorized by `LIGOLO_SCOPE` (previously they
+  refused without an external scope checker).
 - 1.2.0: proxy logs moved from `<workspace>/ligolo-proxy.log` to
-  `<assessment>/state/ligolo.log` + the per-instance numbering above; every tool
+  `<workspace>/ligolo.log` + the per-instance numbering above; every tool
   gained the optional `instance` argument; `ligolo_proxy_start` gained `apiPort`
   and `ligolo_proxy_status` returns a list instead of a single state when called
   with no `instance`.
-
-## Running outside BITORIA
-
-Everything except the framework-mode flag works without a framework checkout:
-proxy lifecycle, agent/interface/route/listener state, fingerprints, teardown,
-and the checkpoint via `LIGOLO_SCOPE`. What you lose is the assessment's
-`scope.yaml` enforcement, `state/decisions.md`, the `commands.log` audit trail
-and the state-dir log placement (logs fall back to `<workspace>/ligolo[<n>].log`).
-
-Minimum viable standalone setup:
-
-```bash
-export LIGOLO_NG_DIR=/opt/ligolo-ng          # release binaries
-export LIGOLO_PROXY_CONFIG=$HOME/.ligolo/ligolo-ng.yaml   # workspace
-export LIGOLO_SCOPE="10.10.10.0/24"          # what you may pivot to
-node dist/index.js                           # or register it in any MCP client
-```
-
-Nothing else is required — no Python, no assessment folder, no shell wrappers.
 
 ## Troubleshooting
 
@@ -508,38 +465,39 @@ Nothing else is required — no Python, no assessment folder, no shell wrappers.
 |---|---|
 | `proxy binary not found` | set `LIGOLO_NG_DIR` to the release dir (holding `proxy`) or `LIGOLO_PROXY_BIN` |
 | `HTTP 401 (proxy API rejects the token — check LIGOLO_USER/LIGOLO_PASSWORD)` | wrong credentials, or a `Bearer ` prefix was hand-rolled into the header; the proxy wants the raw JWT |
-| `no active assessment (…) — mutating ligolo calls are refused` | set `LIGOLO_ASSESSMENT`, or run `pentest assessment activate <name>`; an expired marker does **not** authorize |
-| `checkpoint-denied … exit 5` | the checkpoint is real: record the pivot in `state/decisions.md`, get approval, re-call with `target` + `confirmed: true` (standalone: same thing, the `LIGOLO_SCOPE` entry is the record) |
-| `checkpoint-denied … exit 4` "not enabled for assessment" | add `ligolo:\n  mcp: true` to the assessment's `scope.yaml` (off by default), or use the console wrapper |
-| `checkpoint-denied … exit 3` "not inside LIGOLO_SCOPE" | the target is outside the standalone authorization list; extend `LIGOLO_SCOPE` deliberately |
+| `HTTP 401` right after changing `LIGOLO_PASSWORD` | the proxy config still holds the old password: `ligolo_proxy_start {"rewriteConfig": true}` or update `web.users` (see [Configuration](#configuration)) |
+| `checkpoint-denied … exit 5` | the checkpoint is real: get a human to approve the pivot, then re-call with `target` + `confirmed: true` |
+| `checkpoint-denied … exit 4` "no authorization source configured" | set `LIGOLO_SCOPE` to the hosts/CIDRs you are authorized to reach |
+| `checkpoint-denied … exit 3` "not inside LIGOLO_SCOPE" | the target is outside the authorization list; extend `LIGOLO_SCOPE` deliberately |
 | `agent N not connected (known ids: …)` | the agent died or reconnected with a new id; re-run `ligolo_agents_list` (agents reconnect with `-reconnect`, default on) |
 | `POST /api/v1/routes -> HTTP 500: interface ligolo not found` | register the interface first (`ligolo_interface_create`, or just `ligolo_tunnel_start`, which does it) |
 | `DELETE /api/v1/routes -> HTTP 500: no such process` | the tunnel was stopped before its routes; teardown now deletes routes first and treats an already-gone route as success |
 | `selfcert cache not found at …/ligolo_cert` | the proxy was started without `-selfcert`; start it via `ligolo_proxy_start` or set `LIGOLO_SELFCERT_DIR`/`_DOMAIN` |
-| `a proxy process (pid N) is running but …/ping does not answer` | something else holds the pid file or the proxy died mid-start; `ligolo_proxy_stop`, then check `ligolo-proxy.log` |
+| `proxy did not answer …/api/v1/ping within 20s` | the proxy died mid-start or cannot bind; check `logPath` (`<workspace>/ligolo.log`) |
+| `tun.New device or resource busy` on `ligolo_tunnel_start` | the proxy still holds that TUN (ligolo 0.9.x orphans it when a running tunnel is started elsewhere); use a fresh interface name, or restart the proxy |
 | TUN creation fails / `operation not permitted` | the proxy needs TUN privileges; grant `CAP_NET_ADMIN` or run it as a user allowed to create TUN devices |
 | `report: running: true` but no agents appear | agent cannot reach the operator port — check `LIGOLO_PROXY_ADDR`, egress, and that the agent used the pinned fingerprint |
 
-Logs: `<config dir>/ligolo-proxy.log` (proxy stdout/stderr) and
-`<assessment>/logs/commands.log` (every MCP call, via `log_command.sh`).
+Logs: `<workspace>/ligolo[<n>].log` (proxy stdout/stderr) and the MCP server's
+stderr (captured by the MCP client).
 
 ## Development
 
 ```bash
 npm run build     # tsc -> dist/
 npm run dev       # tsc --watch
-npm test          # build, then 62 tests over real MCP stdio against a stub API
+npm test          # build, then 64 tests over real MCP stdio against a stub API
 ```
 
 The suite needs no ligolo binary, no root and no network: it spawns
 `dist/index.js`, speaks JSON-RPC over stdin/stdout, and asserts what actually
 leaves the process — the HTTP bodies sent to the proxy, that a denied call sends
 **nothing**, teardown ordering, fingerprint equality with the certificate, the
-0600 credential file, and marker-based assessment resolution with its TTL.
+0600 credential file and credential precedence.
 
 Source layout: `src/index.ts` (MCP surface + handlers), `src/ligolo.ts` (API
-client, checkpoint gate, fingerprint, assessment resolution),
-`src/proxy.ts` (proxy lifecycle, config seeding, port override).
+client, checkpoint gate, fingerprint), `src/proxy.ts` (proxy lifecycle, config
+seeding, port override), `src/ledger.ts` (what the MCP created, for `origin`).
 
 ## Security notes
 
@@ -558,16 +516,17 @@ client, checkpoint gate, fingerprint, assessment resolution),
 - The default selfcert domain is `ligolo`, a known IoC — pass
   `-selfcert-domain <innocuous>` (proxy flag) when TLS-inspecting targets exist.
 - Nothing here uploads, deletes or cleans up the agent binary on a client host —
-  that stays an explicit, logged step.
+  that stays an explicit step.
 - See [SECURITY.md](SECURITY.md) for authorized-use scope and reporting.
 
 ## What this server does not do
 
 - It does not create the agent binary, upload it, or clean it up on the target.
-- It does not decide scope: `scope_check.py` does, and it refuses rather than
-  guesses.
+- It does not decide scope: you do, in `LIGOLO_SCOPE`, and it refuses rather
+  than guesses.
 - It does not implement relay chains (multi-hop agent chaining). The supported
-  double pivot is the `listener_add` relay described in the framework doctrine.
+  double pivot is the `listener_add` relay described in [USAGE.md](USAGE.md)
+  (§Double pivot).
 - It does not drive the WebUI. With `LIGOLO_WEBUI=1` it only turns the proxy's
   own UI on for a human, and reports what was changed there as `external`.
 

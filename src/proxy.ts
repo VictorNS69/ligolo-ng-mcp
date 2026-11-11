@@ -494,8 +494,12 @@ export async function instanceStatus(cfg: Config, name?: string): Promise<ProxyS
   } catch {
     reachable = false;
   }
+  // Report the URL this server actually talks to (LIGOLO_API), not the listen
+  // address it would plan for a proxy of its own: for a proxy started elsewhere
+  // (a container, the console wrapper) the two differ, and webui.url sent the
+  // human to a port nothing was serving.
   return {
-    ...stateOf(cfg, spec, null),
+    ...stateOf(cfg, { ...spec, apiUrl: cfg.apiUrl }, null),
     running: reachable,
     managed: false,
     note: reachable

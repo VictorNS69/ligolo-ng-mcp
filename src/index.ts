@@ -493,6 +493,26 @@ function rejectUnknownArgs(name: string, args: Args): void {
   );
 }
 
+/**
+ * A name Linux accepts for a TUN device: 1-15 bytes (IFNAMSIZ - 1), no
+ * whitespace or '/', not "." / "..". The proxy registers any string in its
+ * config and only fails at device creation ("TUNSETIFF failed … invalid
+ * argument"), leaving a pending interface behind — seen in the lab with a
+ * WebUI-created "test desde ui".
+ */
+function assertInterfaceName(name: string): void {
+  const problems: string[] = [];
+  if (Buffer.byteLength(name, "utf8") > 15) problems.push("longer than 15 bytes");
+  if (/[\s/]/.test(name)) problems.push("contains whitespace or '/'");
+  if (name === "." || name === "..") problems.push("is '.' or '..'");
+  if (problems.length > 0) {
+    throw new Error(
+      `interface name "${name}" is not a valid Linux interface name (${problems.join(", ")}). ` +
+        "Use up to 15 characters without spaces, e.g. ligolo2. Nothing was sent to the proxy.",
+    );
+  }
+}
+
 /** IPv4/IPv6 CIDR with a mandatory, in-range prefix length. */
 function isCidr(value: string): boolean {
   const parts = value.split("/");
@@ -611,7 +631,32 @@ async function handleTunnelStart(args: Args): Promise<Payload> {
   const tun = str(args, "tun", c.interfaceName);
   const target = str(args, "target");
   if (target === "") throw new Error("target is required: the in-scope host this tunnel makes reachable");
+  assertInterfaceName(tun);
   const agent = await requireAgent(api, agentId);
+  // ligolo 0.9.1: starting a tunnel on an agent that already runs one opens
+  // the new TUN but leaves it orphaned — after the next tunnel_stop that
+  // device stays held by the proxy ("tun.New device or resource busy") until
+  // the proxy restarts. Reproduced twice in the double-pivot lab. Never move a
+  // running tunnel implicitly; a repeat on the same interface is a no-op.
+  if (agent.Running) {
+    if (agent.Interface === tun) {
+      return {
+        scope_checked: false,
+        instance,
+        agent_id: agentId,
+        agent_name: agent.Name,
+        interface: tun,
+        already_running: true,
+        message: `agent ${agentId} already runs its tunnel on ${tun} — nothing changed.`,
+      };
+    }
+    throw new Error(
+      `agent ${agentId} already runs a tunnel on ${agent.Interface || "an interface"}; starting another on ${tun} ` +
+        "would leave a TUN orphaned and held by the proxy (ligolo 0.9.x). Stop it first with ligolo_tunnel_stop, " +
+        `then start it on ${tun}. Routes stay on their interface, so move them with ligolo_route_delete/route_add. ` +
+        "Nothing was sent to the proxy.",
+    );
+  }
   gate(
     target,
     bool(args, "confirmed", false),
@@ -886,6 +931,7 @@ async function handleToolCall(name: string, args: Args): Promise<Payload> {
     case "ligolo_interface_create": {
       const { c, api, instance } = ctx(args);
       const iface = str(args, "name", c.interfaceName);
+      assertInterfaceName(iface);
       log(`ligolo_interface_create instance=${instance} ${iface}`);
       const created = await api.createInterface(iface);
       track(c, (l) => l.record("interface", keys.interface(iface)));

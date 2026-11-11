@@ -48,6 +48,23 @@ started from.
   with `TUNSETIFF failed … device or resource busy`. The error now names the
   leftover device and how to remove it. Seen against proxy 0.9.1.
 
+- **Found in a Docker double-pivot lab** (proxy 0.9.1 in a container,
+  operator → pivot1 → listener → pivot2 → target):
+  - `ligolo_tunnel_start` on an agent whose tunnel is already running on
+    another interface is refused, and a repeat on the same interface is an
+    `already_running` no-op. ligolo leaves the new TUN orphaned: after the next
+    stop, the device stays held (`tun.New device or resource busy`) until the
+    proxy restarts. Reproduced deliberately, twice.
+  - That `busy` error now explains the cause and the way out (fresh interface
+    name, or restart the proxy).
+  - Interface names Linux rejects (over 15 bytes, whitespace, `/`) are refused
+    by `ligolo_interface_create` and `ligolo_tunnel_start` before the proxy
+    registers them. The proxy accepts any string and leaves a pending interface
+    (`TUNSETIFF … invalid argument`).
+  - For a proxy this server did not start, `apiUrl` and `webui.url` reported
+    the planned listen address (`:8080`) instead of `LIGOLO_API`, sending the
+    human to the wrong port.
+
 ### Changed
 
 - `ligolo_listener_delete` on a listener that is already gone returns

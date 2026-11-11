@@ -616,8 +616,25 @@ export class LigoloApi {
     }
   }
 
-  startTunnel(agentId: string, iface: string): Promise<{ message: string }> {
-    return this.call("POST", `/api/v1/tunnel/${encodeURIComponent(agentId)}`, { Interface: iface });
+  /**
+   * "tun.New device or resource busy" means the proxy itself still holds the
+   * device — typically a tunnel orphaned when a running tunnel was started on
+   * another interface (ligolo 0.9.x). Only a proxy restart releases it.
+   */
+  async startTunnel(agentId: string, iface: string): Promise<{ message: string }> {
+    try {
+      return await this.call("POST", `/api/v1/tunnel/${encodeURIComponent(agentId)}`, { Interface: iface });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/tun\.New/i.test(msg) && /busy/i.test(msg)) {
+        throw new Error(
+          `${msg} — the proxy still holds ${iface}, usually from a tunnel orphaned when a running tunnel was ` +
+            "started on another interface. Only a proxy restart frees it: use a fresh interface name now " +
+            "(and move its routes there), or restart the proxy when convenient.",
+        );
+      }
+      throw err;
+    }
   }
 
   stopTunnel(agentId: string): Promise<{ message: string }> {

@@ -160,6 +160,9 @@ function makeApi() {
       }
       if (/^\/api\/v1\/tunnel\/\d+$/.test(url) && req.method === "POST") {
         state.calls.at(-1).body = parsed;
+        if (parsed.Interface === "heldtun") {
+          return send(500, { error: "unable to open tun interface 'heldtun' (tun.New device or resource busy)" });
+        }
         return send(200, { message: "tunnel starting" });
       }
       if (/^\/api\/v1\/tunnel\/\d+$/.test(url) && req.method === "DELETE") {
@@ -1388,6 +1391,70 @@ describe("regressions", () => {
       assert.equal(isError, true);
       assert.match(payload.message, /TUN device named busyif already exists/);
       assert.match(payload.message, /ip link delete busyif/);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("reports the URL it talks to for a proxy it did not start (webui.url included)", async () => {
+    const h = await startServer();
+    try {
+      writeFileSync(
+        join(h.workdir, "ligolo-ng.yaml"),
+        "web:\n  enabled: true\n  enableui: true\n  listen: 0.0.0.0:8080\n  users:\n    ligolo: x\n    operator: y\n",
+      );
+      const { payload } = await h.client.call("ligolo_proxy_status");
+      const api = payload.apiUrl;
+      assert.match(api, /^http:\/\/127\.0\.0\.1:\d+$/);
+      assert.notEqual(api, "http://127.0.0.1:8080", "must be LIGOLO_API, not the planned listen address");
+      assert.equal(payload.webui.url, `${api}/`);
+      assert.equal(payload.webui.login.api_url, api);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("refuses an interface name Linux rejects, before the proxy registers it", async () => {
+    const h = await startServer({ standaloneScope: "10.0.0.0/8", assessment: "" });
+    try {
+      for (const [tool, args] of [
+        ["ligolo_interface_create", { name: "test desde ui" }],
+        ["ligolo_interface_create", { name: "a-name-way-too-long" }],
+        ["ligolo_tunnel_start", { agentId: "1", tun: "bad/name", target: "10.0.0.5", confirmed: true }],
+      ]) {
+        const { isError, payload } = await h.client.call(tool, args);
+        assert.equal(isError, true, tool);
+        assert.match(payload.message, /not a valid Linux interface name/);
+      }
+      assert.deepEqual(mutatingCalls(h.state), []);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("never moves a running tunnel to another interface (ligolo orphans the TUN)", async () => {
+    const h = await startServer({ standaloneScope: "10.0.0.0/8", assessment: "" });
+    try {
+      h.state.agents[1].Running = true;
+      h.state.agents[1].Interface = "ligolo";
+      const moved = await h.client.call("ligolo_tunnel_start", { agentId: "1", tun: "ligolo2", target: "10.0.0.5", confirmed: true });
+      assert.equal(moved.isError, true);
+      assert.match(moved.payload.message, /already runs a tunnel on ligolo.*Stop it first/);
+      const same = await h.client.call("ligolo_tunnel_start", { agentId: "1", tun: "ligolo", target: "10.0.0.5", confirmed: true });
+      assert.equal(same.isError, false, JSON.stringify(same.payload));
+      assert.equal(same.payload.already_running, true);
+      assert.deepEqual(mutatingCalls(h.state), [], "neither call may reach the proxy");
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("explains a TUN the proxy itself still holds", async () => {
+    const h = await startServer({ standaloneScope: "10.0.0.0/8", assessment: "" });
+    try {
+      const { isError, payload } = await h.client.call("ligolo_tunnel_start", { agentId: "1", tun: "heldtun", target: "10.0.0.5", confirmed: true });
+      assert.equal(isError, true);
+      assert.match(payload.message, /the proxy still holds heldtun.*fresh interface name/);
     } finally {
       await h.cleanup();
     }

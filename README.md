@@ -417,7 +417,7 @@ Mutating (10, hidden with `LIGOLO_MCP_READ_ONLY=1`):
 | `ligolo_proxy_start` | `port?`, `apiPort?`, `rewriteConfig?`, `reuse?` | none — starts the proxy headless with a seeded loopback-API config |
 | `ligolo_proxy_stop` | — | none — SIGTERM via pid file |
 | `ligolo_interface_create` | `name?` | none (local TUN only) |
-| `ligolo_tunnel_start` | `agentId`, `target`, `tun?`, `confirmed?` | **lateral checkpoint**; registers the interface first if missing |
+| `ligolo_tunnel_start` | `agentId`, `target`, `tun?`, `confirmed?` | **lateral checkpoint**; registers the interface first if missing; refuses to move an already running tunnel (ligolo would orphan the TUN) |
 | `ligolo_tunnel_stop` | `agentId` | none (cleanup) |
 | `ligolo_route_add` | `network`, `target?` (required unless `/32`), `interface?`, `confirmed?` | **lateral checkpoint** |
 | `ligolo_route_delete` | `network`, `interface?` | none (cleanup) |
@@ -528,7 +528,7 @@ Logs: `<config dir>/ligolo-proxy.log` (proxy stdout/stderr) and
 ```bash
 npm run build     # tsc -> dist/
 npm run dev       # tsc --watch
-npm test          # build, then 57 tests over real MCP stdio against a stub API
+npm test          # build, then 61 tests over real MCP stdio against a stub API
 ```
 
 The suite needs no ligolo binary, no root and no network: it spawns

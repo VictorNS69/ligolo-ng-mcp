@@ -825,7 +825,11 @@ async function handleTeardown(args: Args): Promise<Payload> {
   // is already gone counts as cleaned up, not as a failure.
   const interfaces = await api.interfaces().catch(() => ({}) as Record<string, unknown>);
   const record = (interfaces ?? {})[iface] as { Routes?: { Destination: string }[] } | undefined;
-  const routes = (record?.Routes ?? []).filter((r) => !r.Destination.includes(":"));
+  // Skip only ligolo's own IPv6 link-local routes (fe80::/64, added on every
+  // tunnel start — two of them after a restart, as seen in the lab). Skipping
+  // every address with a ':' also left any IPv6 route the operator added in
+  // place after teardown.
+  const routes = (record?.Routes ?? []).filter((r) => !/^fe80:/i.test(r.Destination));
   for (const route of routes) {
     await attempt(`delete route ${route.Destination}`, async () => {
       const done = await api.deleteRoute(iface, route.Destination).catch((err: unknown) => {

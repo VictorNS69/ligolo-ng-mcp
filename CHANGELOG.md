@@ -65,6 +65,11 @@ started from.
     the planned listen address (`:8080`) instead of `LIGOLO_API`, sending the
     human to the wrong port.
 
+- **`ligolo_teardown` now removes IPv6 routes.** It skipped every destination
+  containing `:`, so an IPv6 route added through the MCP survived teardown. It
+  now skips only ligolo's own `fe80::/64` link-local routes, which the proxy
+  adds on each tunnel start (two of them after a restart, seen in the lab).
+
 ### Changed
 
 - `ligolo_listener_delete` on a listener that is already gone returns

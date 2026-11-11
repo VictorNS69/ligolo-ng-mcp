@@ -562,6 +562,29 @@ describe("tunnel and listener operations", () => {
       await h.cleanup();
     }
   });
+
+  it("removes IPv6 routes on teardown but leaves ligolo's link-local ones alone", async () => {
+    const h = await startServer();
+    try {
+      h.state.interfaces.ligolo = {
+        Active: true,
+        Routes: [
+          { Destination: "10.10.10.0/24", Active: true },
+          { Destination: "fd00:10::/64", Active: true },
+          { Destination: "fe80::/64", Active: true },
+          { Destination: "fe80::/64", Active: true },
+        ],
+      };
+      const { isError, payload } = await h.client.call("ligolo_teardown", { agentId: "1", interface: "ligolo" });
+      assert.equal(isError, false, JSON.stringify(payload));
+      const deleted = mutatingCalls(h.state)
+        .filter((c) => c.method === "DELETE" && c.path === "/api/v1/routes")
+        .map((c) => c.body.Route);
+      assert.deepEqual(deleted, ["10.10.10.0/24", "fd00:10::/64"]);
+    } finally {
+      await h.cleanup();
+    }
+  });
 });
 
 describe("certificate pinning", () => {

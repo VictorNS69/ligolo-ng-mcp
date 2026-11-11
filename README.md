@@ -528,7 +528,7 @@ Logs: `<config dir>/ligolo-proxy.log` (proxy stdout/stderr) and
 ```bash
 npm run build     # tsc -> dist/
 npm run dev       # tsc --watch
-npm test          # build, then 61 tests over real MCP stdio against a stub API
+npm test          # build, then 62 tests over real MCP stdio against a stub API
 ```
 
 The suite needs no ligolo binary, no root and no network: it spawns

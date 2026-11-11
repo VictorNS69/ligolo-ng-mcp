@@ -10,7 +10,7 @@ import { describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const DIST = resolve(dirname(fileURLToPath(import.meta.url)), "..", "dist");
-const { targetInScope, assertScope, GateError } = await import(pathToFileURL(join(DIST, "ligolo.js")).href);
+const { targetInScope, networkInScope, targetInNetwork, assertScope, assertRouteScope, GateError } = await import(pathToFileURL(join(DIST, "ligolo.js")).href);
 const { Ledger, computeDrift, liveResources, keys } = await import(pathToFileURL(join(DIST, "ledger.js")).href);
 
 describe("targetInScope", () => {
@@ -33,8 +33,13 @@ describe("targetInScope", () => {
     [["DC01.corp"], "dc01.CORP", true, "hostnames match case-insensitively"],
     [["dc01.corp"], "dc02.corp", false, "different hostname"],
     [["fd00::1"], "[fd00::1]", true, "bracketed IPv6 matches exactly"],
-    // IPv6 ranges are exact-match only (documented); this fails closed.
-    [["fd00::/64"], "fd00::1", false, "IPv6 CIDR is not range-matched"],
+    [["fd00::/64"], "fd00::1", true, "inside an IPv6 range"],
+    [["fd00::/64"], "fd00:0:0:1::1", false, "just outside an IPv6 range"],
+    [["fd00::1"], "FD00:0:0::1", true, "IPv6 compared by value, not spelling"],
+    [["::ffff:10.0.0.0/120"], "::ffff:10.0.0.7", true, "IPv6 with an embedded IPv4 tail"],
+    [["1::2::3/64"], "1::3", false, "malformed IPv6 entry matches nothing"],
+    [["10.0.0.0/8"], "fd00::1", false, "families never cross"],
+    [["10.0.0.0/24"], "010.0.0.1", false, "leading-zero octet (octal to other parsers) is refused"],
     [["192.168.1.0/24", " 10.0.0.0/8 "], "10.1.2.3", true, "later entry, padded with spaces"],
     [[], "10.0.0.1", false, "empty scope"],
     [[""], "10.0.0.1", false, "blank entry"],
@@ -44,6 +49,70 @@ describe("targetInScope", () => {
       assert.equal(targetInScope(scope, target), expected);
     });
   }
+});
+
+describe("networkInScope", () => {
+  const cases = [
+    [["10.10.10.0/24"], "10.10.10.0/24", true, "the scope entry itself"],
+    [["10.10.10.0/24"], "10.10.10.128/25", true, "a narrower subnet"],
+    [["10.10.10.5"], "10.10.10.5/32", true, "a single scoped host"],
+    [["10.10.10.0/24"], "10.10.0.0/16", false, "a wider network"],
+    [["10.10.10.5"], "0.0.0.0/0", false, "default route from one scoped host"],
+    [["10.10.10.0/25", "10.10.10.128/25"], "10.10.10.0/24", false, "must fit inside a single entry"],
+    [["10.0.0.0/8"], "10.1.2.3/24", true, "host bits in the network are masked"],
+    [["fd00::/48"], "fd00:0:0:1::/64", true, "IPv6 subnet"],
+    [["fd00::/64"], "fd00::/48", false, "wider IPv6 network"],
+    [["10.0.0.0/8"], "fd00::/64", false, "different family"],
+    [["dc01.corp"], "10.0.0.0/24", false, "hostnames never cover a network"],
+    [["10.0.0.0/8"], "not-a-cidr", false, "malformed network"],
+  ];
+  for (const [scope, network, expected, why] of cases) {
+    it(`${why}: ${JSON.stringify(scope)} ⊇ ${network} → ${expected}`, () => {
+      assert.equal(networkInScope(scope, network), expected);
+    });
+  }
+});
+
+describe("targetInNetwork", () => {
+  it("accepts a target inside the network and refuses one outside", () => {
+    assert.equal(targetInNetwork("10.20.0.0/24", "10.20.0.5"), true);
+    assert.equal(targetInNetwork("10.20.0.0/24", "10.30.0.5"), false);
+    assert.equal(targetInNetwork("fd00::/64", "fd00::9"), true);
+    assert.equal(targetInNetwork("10.20.0.0/24", "dc01.corp"), false);
+  });
+});
+
+describe("assertRouteScope", () => {
+  const codeOf = (fn) => {
+    try {
+      fn();
+    } catch (err) {
+      assert.ok(err instanceof GateError, `expected GateError, got ${err}`);
+      return [err.code, err.message];
+    }
+    return null;
+  };
+  const cfg = { scope: ["10.10.10.0/24"] };
+
+  it("refuses a route wider than the scope with code 3", () => {
+    const [code, message] = codeOf(() => assertRouteScope(cfg, "10.10.0.0/16", "10.10.10.5", true));
+    assert.equal(code, 3);
+    assert.match(message, /not contained in LIGOLO_SCOPE/);
+  });
+  it("refuses a target outside the routed network with code 3", () => {
+    const [code, message] = codeOf(() => assertRouteScope(cfg, "10.10.10.0/25", "10.10.10.200", true));
+    assert.equal(code, 3);
+    assert.match(message, /not inside the routed network/);
+  });
+  it("still needs confirmation for a contained route", () => {
+    assert.equal(codeOf(() => assertRouteScope(cfg, "10.10.10.0/25", "10.10.10.5", false))[0], 5);
+  });
+  it("reports a missing scope as code 4, not as an uncontained route", () => {
+    assert.equal(codeOf(() => assertRouteScope({ scope: [] }, "10.10.10.0/24", "10.10.10.5", true))[0], 4);
+  });
+  it("passes a contained, confirmed route", () => {
+    assert.equal(codeOf(() => assertRouteScope(cfg, "10.10.10.0/24", "10.10.10.5", true)), null);
+  });
 });
 
 describe("assertScope", () => {

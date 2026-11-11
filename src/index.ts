@@ -24,6 +24,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import {
+  assertRouteScope,
   assertScope,
   certFingerprint,
   Config,
@@ -693,7 +694,7 @@ async function handleRouteAdd(args: Args): Promise<Payload> {
         "evaluated against something real (visible != authorized).",
     );
   }
-  gate(target, bool(args, "confirmed", false));
+  assertRouteScope(cfg, network, target, bool(args, "confirmed", false));
   let applied: { message: string };
   try {
     applied = await api.addRoutes(iface, [network]);

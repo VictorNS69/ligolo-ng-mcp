@@ -354,12 +354,17 @@ A reachability-changing call then needs a `target` inside that list **and**
 |---|---|
 | target in scope + `confirmed: true` | the call proceeds |
 | target outside `LIGOLO_SCOPE` | `{"error":"checkpoint-denied","exit_code":3,"action_taken":false}`; **nothing** is sent to the proxy |
+| route `network` not contained in one `LIGOLO_SCOPE` entry, or `target` outside that `network` | `checkpoint-denied`, `exit_code: 3`; **nothing** is sent to the proxy |
 | target in scope, no `confirmed` | `checkpoint-denied`, `exit_code: 5` — a human approves the pivot, then the call is repeated with `confirmed: true` |
 | `LIGOLO_SCOPE` unset | `checkpoint-denied`, `exit_code: 4` — no authorization configured |
 
 `target` is the in-scope host the action makes reachable. For a route wider than
 `/32` it is required explicitly — "visible in `ifconfig`" is not authorization.
-IPv4 ranges are bit-compared; anything else is matched exactly. Cleanup tools
+A route makes its whole range reachable, so its `network` must also fit entirely
+inside a single `LIGOLO_SCOPE` entry and `target` must lie inside it: with
+`LIGOLO_SCOPE=10.10.10.5`, `10.10.10.5/32` is allowed and `0.0.0.0/0` is not.
+IPv4 and IPv6 ranges are bit-compared; hostnames match exactly
+(case-insensitively), and octets with leading zeros (`010.0.0.1`) are refused. Cleanup tools
 (`*_delete`, `ligolo_teardown`, `ligolo_tunnel_stop`) are not gated: reversing a
 pivot is not a new reachability transition.
 
@@ -396,7 +401,7 @@ Mutating (10, hidden with `LIGOLO_MCP_READ_ONLY=1`):
 | `ligolo_interface_create` | `name?` | none (local TUN only) |
 | `ligolo_tunnel_start` | `agentId`, `target`, `tun?`, `confirmed?` | **lateral checkpoint**; registers the interface first if missing; refuses to move an already running tunnel (ligolo would orphan the TUN) |
 | `ligolo_tunnel_stop` | `agentId` | none (cleanup) |
-| `ligolo_route_add` | `network`, `target?` (required unless `/32`), `interface?`, `confirmed?` | **lateral checkpoint** |
+| `ligolo_route_add` | `network`, `target?` (required unless `/32`), `interface?`, `confirmed?` | **lateral checkpoint**; `network` must be contained in `LIGOLO_SCOPE` and hold `target` |
 | `ligolo_route_delete` | `network`, `interface?` | none (cleanup) |
 | `ligolo_listener_add` | `localAddress`, `remoteAddress`, `agentId`, `target`, `network?`, `confirmed?` | **lateral checkpoint**; also a resident artifact on the agent's host — track it for cleanup |
 | `ligolo_listener_delete` | `listenerId`, `agentId` | none (cleanup) |
@@ -473,6 +478,7 @@ Versus upstream 1.0.0:
 | `checkpoint-denied … exit 5` | the checkpoint is real: get a human to approve the pivot, then re-call with `target` + `confirmed: true` |
 | `checkpoint-denied … exit 4` "no authorization source configured" | set `LIGOLO_SCOPE` to the hosts/CIDRs you are authorized to reach |
 | `checkpoint-denied … exit 3` "not inside LIGOLO_SCOPE" | the target is outside the authorization list; extend `LIGOLO_SCOPE` deliberately |
+| `checkpoint-denied … exit 3` "route … is not contained in LIGOLO_SCOPE" | the route is wider than what is authorized; route a narrower network inside one scope entry (e.g. the `/24` you were given, not a `/16` or `0.0.0.0/0`) |
 | `agent N not connected (known ids: …)` | the agent died or reconnected with a new id; re-run `ligolo_agents_list` (agents reconnect with `-reconnect`, default on) |
 | `POST /api/v1/routes -> HTTP 500: interface ligolo not found` | register the interface first (`ligolo_interface_create`, or just `ligolo_tunnel_start`, which does it) |
 | `DELETE /api/v1/routes -> HTTP 500: no such process` | the tunnel was stopped before its routes; teardown now deletes routes first and treats an already-gone route as success |

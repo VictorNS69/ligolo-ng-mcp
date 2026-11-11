@@ -814,7 +814,7 @@ describe("authorization sources", () => {
       });
       assert.equal(isError, true);
       assert.equal(payload.exit_code, 3);
-      assert.match(payload.message, /not inside LIGOLO_SCOPE/);
+      assert.match(payload.message, /not (inside|contained in) LIGOLO_SCOPE/);
       assert.deepEqual(mutatingCalls(h.state), []);
     } finally {
       await h.cleanup();
@@ -1429,10 +1429,8 @@ describe("gate on every reachability-changing tool", () => {
     }
   });
 
-  // Known gap: route_add gates only `target`, not `network`. A single in-scope
-  // host currently authorizes a route of any width. Un-todo these once the
-  // gate checks that the network is contained in LIGOLO_SCOPE.
-  it("refuses a route wider than LIGOLO_SCOPE, even with an in-scope target", { todo: "route_add does not gate the network yet" }, async () => {
+  // A single in-scope host used to authorize a route of any width.
+  it("refuses a route wider than LIGOLO_SCOPE, even with an in-scope target", async () => {
     const h = await startServer({ scope: "10.10.10.5" });
     try {
       const { isError, payload } = await h.client.call("ligolo_route_add", {
@@ -1442,21 +1440,40 @@ describe("gate on every reachability-changing tool", () => {
       });
       assert.equal(isError, true);
       assert.equal(payload.exit_code, 3);
+      assert.match(payload.message, /not contained in LIGOLO_SCOPE/);
       assert.deepEqual(mutatingCalls(h.state), []);
     } finally {
       await h.cleanup();
     }
   });
 
-  it("refuses a route whose target lies outside its network", { todo: "route_add does not check target ∈ network yet" }, async () => {
+  it("accepts an IPv6 route contained in an IPv6 scope", async () => {
+    const h = await startServer({ scope: "fd00:10::/48" });
+    try {
+      const { isError, payload } = await h.client.call("ligolo_route_add", {
+        network: "fd00:10:0:1::/64",
+        target: "fd00:10:0:1::5",
+        confirmed: true,
+      });
+      assert.equal(isError, false, JSON.stringify(payload));
+      const post = mutatingCalls(h.state).find((c) => c.method === "POST" && c.path.includes("route"));
+      assert.ok(post, "route call reached the API");
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("refuses a route whose target lies outside its network", async () => {
     const h = await startServer({ scope: "10.0.0.0/8" });
     try {
-      const { isError } = await h.client.call("ligolo_route_add", {
+      const { isError, payload } = await h.client.call("ligolo_route_add", {
         network: "10.20.0.0/24",
         target: "10.30.0.5",
         confirmed: true,
       });
       assert.equal(isError, true);
+      assert.equal(payload.exit_code, 3);
+      assert.match(payload.message, /not inside the routed network/);
       assert.deepEqual(mutatingCalls(h.state), []);
     } finally {
       await h.cleanup();

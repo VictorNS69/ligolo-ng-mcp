@@ -4,6 +4,33 @@ Fork of [`schwarztim/sec-ligolo-ng-mcp`](https://github.com/schwarztim/sec-ligol
 (MIT). Versions below are this fork's; `1.0.0` is the upstream initial release it
 started from.
 
+## Unreleased
+
+### Security (breaking)
+
+- **`ligolo_route_add` now gates the routed network, not only `target`.** The
+  whole `network` must fit inside a single `LIGOLO_SCOPE` entry, and `target`
+  must lie inside that network; otherwise the call is refused with
+  `checkpoint-denied`, `exit_code: 3`, before anything is sent. Previously one
+  in-scope host authorized a route of any width — with
+  `LIGOLO_SCOPE=10.10.10.5`, `0.0.0.0/0` passed the gate. Migration: route the
+  ranges you are authorized for, or list the wider range in `LIGOLO_SCOPE`
+  deliberately.
+
+### Changed
+
+- IPv6 scope entries are range-matched (`fd00::/64` covers `fd00::1`); they
+  used to match only the exact string, so IPv6 routes could never pass the
+  new network check.
+- IPv4 octets with leading zeros (`010.0.0.1`) are rejected by the scope
+  matcher: other parsers read them as octal, so the gate could disagree with
+  the tool that later uses the address.
+
+### Fixed
+
+- CI: `npm test` runs `node --test test/*.test.mjs`; `node --test test/`
+  failed on Node 22/24, which treat arguments as globs.
+
 ## 2.0.0 — 2026-11-11
 
 ### Removed (breaking)

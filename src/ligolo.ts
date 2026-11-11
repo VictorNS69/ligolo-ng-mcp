@@ -11,8 +11,9 @@
 //
 // One behaviour is non-negotiable: every reachability-changing call
 // (route add, tunnel start, listener add) passes the lateral-movement gate
-// *before* an HTTP request leaves the process — its target must be inside
-// LIGOLO_SCOPE and the call must carry `confirmed: true`. Denied = nothing
+// *before* an HTTP request leaves the process — its target (and, for a
+// route, the whole routed network) must be inside LIGOLO_SCOPE and the call
+// must carry `confirmed: true`. Denied = nothing
 // happened, and the error says why.
 
 import { spawnSync } from "node:child_process";
@@ -155,37 +156,132 @@ export class GateError extends Error {
   }
 }
 
-function ipv4ToInt(ip: string): number | null {
-  const parts = ip.split(".");
-  if (parts.length !== 4) return null;
-  let value = 0;
-  for (const part of parts) {
-    if (!/^\d{1,3}$/.test(part)) return null;
-    const octet = Number(part);
-    if (octet > 255) return null;
-    value = (value << 8) + octet;
-  }
-  return value >>> 0;
+/** An address as an integer of its family, so v4 and v6 share one comparison path. */
+interface Ip {
+  v: 4 | 6;
+  value: bigint;
 }
 
-/** Host/CIDR membership. IPv4 ranges bit-compared; anything else exact-match. */
+const BITS = { 4: 32, 6: 128 } as const;
+
+function parseIpv4(ip: string): bigint | null {
+  const parts = ip.split(".");
+  if (parts.length !== 4) return null;
+  let value = 0n;
+  for (const part of parts) {
+    // No leading zeros: "010" is 10 here but 8 to inet_aton-style parsers, and
+    // the gate must not disagree with the tools that later use the address.
+    if (!/^(0|[1-9]\d{0,2})$/.test(part)) return null;
+    const octet = Number(part);
+    if (octet > 255) return null;
+    value = (value << 8n) + BigInt(octet);
+  }
+  return value;
+}
+
+function parseIpv6(ip: string): bigint | null {
+  let addr = ip.toLowerCase();
+  if (addr.includes("%")) return null; // zone ids are not routable scope
+  // A trailing dotted quad (::ffff:10.0.0.1) counts as two groups.
+  const tail = /^(.*:)(\d+\.\d+\.\d+\.\d+)$/.exec(addr);
+  if (tail !== null) {
+    const v4 = parseIpv4(tail[2]);
+    if (v4 === null) return null;
+    addr = `${tail[1]}${(v4 >> 16n).toString(16)}:${(v4 & 0xffffn).toString(16)}`;
+  }
+  const halves = addr.split("::");
+  if (halves.length > 2) return null;
+  const groups = (h: string): string[] => (h === "" ? [] : h.split(":"));
+  const head = groups(halves[0]);
+  const rest = halves.length === 2 ? groups(halves[1]) : [];
+  const missing = 8 - head.length - rest.length;
+  if (halves.length === 2 ? missing < 1 : missing !== 0) return null;
+  const all = [...head, ...Array<string>(halves.length === 2 ? missing : 0).fill("0"), ...rest];
+  let value = 0n;
+  for (const g of all) {
+    if (!/^[0-9a-f]{1,4}$/.test(g)) return null;
+    value = (value << 16n) + BigInt(parseInt(g, 16));
+  }
+  return value;
+}
+
+function parseIp(raw: string): Ip | null {
+  const ip = raw.trim().replace(/^\[|\]$/g, "");
+  const v4 = parseIpv4(ip);
+  if (v4 !== null) return { v: 4, value: v4 };
+  if (!ip.includes(":")) return null;
+  const v6 = parseIpv6(ip);
+  return v6 === null ? null : { v: 6, value: v6 };
+}
+
+/** A parsed CIDR (a bare address is its own /32 or /128); null if malformed. */
+interface Net {
+  v: 4 | 6;
+  base: bigint;
+  bits: number;
+}
+
+function parseNet(raw: string): Net | null {
+  const [addr, bitsRaw, extra] = raw.trim().split("/");
+  if (extra !== undefined) return null;
+  const ip = parseIp(addr);
+  if (ip === null) return null;
+  const max = BITS[ip.v];
+  let bits: number = max;
+  if (bitsRaw !== undefined) {
+    if (!/^\d{1,3}$/.test(bitsRaw)) return null;
+    bits = Number(bitsRaw);
+    if (bits > max) return null;
+  }
+  return { v: ip.v, base: ip.value & mask(ip.v, bits), bits };
+}
+
+function mask(v: 4 | 6, bits: number): bigint {
+  const max = BigInt(BITS[v]);
+  const all = (1n << max) - 1n;
+  return bits === 0 ? 0n : (all >> (max - BigInt(bits))) << (max - BigInt(bits));
+}
+
+/** True when `inner` lies entirely inside `outer` (same family, no wider, same prefix bits). */
+function netContains(outer: Net, inner: Net): boolean {
+  return outer.v === inner.v && outer.bits <= inner.bits && (inner.base & mask(outer.v, outer.bits)) === outer.base;
+}
+
+/**
+ * Host/CIDR membership for a single target. IPv4 and IPv6 ranges are
+ * bit-compared; a non-address entry (a hostname) matches only itself,
+ * case-insensitively. A malformed entry matches nothing — never everything.
+ */
 export function targetInScope(scope: string[], target: string): boolean {
   const host = target.replace(/^\[|\]$/g, "").split("/")[0].trim();
-  const hostInt = ipv4ToInt(host);
+  const ip = parseIp(host);
   for (const raw of scope) {
     const entry = raw.trim();
     if (entry === "") continue;
     if (entry.toLowerCase() === host.toLowerCase()) return true;
-    const [net, bitsRaw] = entry.split("/");
-    if (bitsRaw === undefined) continue;
-    const bits = Number(bitsRaw);
-    if (!Number.isInteger(bits) || bits < 0 || bits > 32) continue;
-    const netInt = ipv4ToInt(net);
-    if (netInt === null || hostInt === null) continue;
-    const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
-    if ((hostInt & mask) === (netInt & mask)) return true;
+    if (ip === null) continue;
+    const net = parseNet(entry);
+    if (net !== null && netContains(net, { v: ip.v, base: ip.value, bits: BITS[ip.v] })) return true;
   }
   return false;
+}
+
+/** True when the whole of `network` (a CIDR) lies inside a single LIGOLO_SCOPE entry. */
+export function networkInScope(scope: string[], network: string): boolean {
+  const net = parseNet(network);
+  if (net === null) return false;
+  return scope.some((raw) => {
+    const entry = parseNet(raw);
+    return entry !== null && netContains(entry, net);
+  });
+}
+
+/** True when `target` (an address) lies inside `network` (a CIDR). */
+export function targetInNetwork(network: string, target: string): boolean {
+  const net = parseNet(network);
+  const ip = parseIp(target.split("/")[0]);
+  if (net === null || ip === null) return false;
+  return netContains(net, { v: ip.v, base: ip.value, bits: BITS[ip.v] });
 }
 
 /**
@@ -220,6 +316,31 @@ export function assertScope(cfg: Config, target: string, confirmed: boolean): vo
       5,
     );
   }
+}
+
+/**
+ * The gate for a route: a route makes a whole range reachable, so a single
+ * in-scope host must not authorize a wider one. The routed network has to fit
+ * inside one LIGOLO_SCOPE entry, and `target` has to lie inside the network —
+ * then the usual target check and human confirmation apply.
+ */
+export function assertRouteScope(cfg: Config, network: string, target: string, confirmed: boolean): void {
+  if (cfg.scope.length > 0 && !networkInScope(cfg.scope, network)) {
+    throw new GateError(
+      `route ${network} is not contained in LIGOLO_SCOPE (${cfg.scope.join(", ")}). ` +
+        "A route makes the whole range reachable, so every address in it must be authorized: route a narrower " +
+        "network that fits inside one scope entry, or extend the list deliberately.",
+      3,
+    );
+  }
+  if (cfg.scope.length > 0 && !targetInNetwork(network, target)) {
+    throw new GateError(
+      `target ${target} is not inside the routed network ${network}. Name an in-scope host that this route ` +
+        "actually makes reachable.",
+      3,
+    );
+  }
+  assertScope(cfg, target, confirmed);
 }
 
 /** Colon-free uppercase SHA-256 of the proxy's cached selfcert — exactly what `-accept-fingerprint` takes. */

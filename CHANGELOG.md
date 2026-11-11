@@ -28,6 +28,10 @@ started from.
 
 ### Fixed
 
+- `ligolo_teardown` and `ligolo_tunnel_stop` refuse a call without `agentId`
+  before touching the proxy. Teardown used to delete the interface's routes,
+  then fail on `DELETE /api/v1/tunnel/` and leave the agent's listeners in
+  place — half a cleanup.
 - CI: `npm test` runs `node --test test/*.test.mjs`; `node --test test/`
   failed on Node 22/24, which treat arguments as globs.
 

@@ -780,6 +780,11 @@ async function handleListenerAdd(args: Args): Promise<Payload> {
 async function handleTeardown(args: Args): Promise<Payload> {
   const { c, api, instance } = ctx(args);
   const agentId = str(args, "agentId");
+  // Without it the teardown used to delete the interface's routes, then fail on
+  // DELETE /api/v1/tunnel/ and never reach the listeners: half a cleanup.
+  if (agentId === "") {
+    throw new Error("agentId is required (from ligolo_agents_list). Nothing was sent to the proxy.");
+  }
   const iface = str(args, "interface", c.interfaceName);
   const deleteInterface = bool(args, "deleteInterface", false);
   const steps: Payload[] = [];
@@ -961,6 +966,9 @@ async function handleToolCall(name: string, args: Args): Promise<Payload> {
     case "ligolo_tunnel_stop": {
       const { c, api, instance } = ctx(args);
       const agentId = str(args, "agentId");
+      if (agentId === "") {
+        throw new Error("agentId is required (from ligolo_agents_list). Nothing was sent to the proxy.");
+      }
       const session = (await api.agents().catch(() => null))?.[agentId]?.SessionID;
       const stopped = await api.stopTunnel(agentId);
       if (session !== undefined) track(c, (l) => l.forget("tunnel", keys.tunnel(session)));

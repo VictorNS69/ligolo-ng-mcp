@@ -1309,6 +1309,20 @@ describe("regressions", () => {
     }
   });
 
+  it("refuses teardown and tunnel_stop without agentId, before any mutating call", async () => {
+    const h = await startServer();
+    try {
+      for (const tool of ["ligolo_teardown", "ligolo_tunnel_stop"]) {
+        const { isError, payload } = await h.client.call(tool, {});
+        assert.equal(isError, true, tool);
+        assert.match(payload.message, /agentId is required/, tool);
+      }
+      assert.deepEqual(mutatingCalls(h.state), []);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
   it("derives the default API URL from LIGOLO_API_LISTEN", async () => {
     const { loadConfig } = await import("../dist/ligolo.js");
     const base = {};

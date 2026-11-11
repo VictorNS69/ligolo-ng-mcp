@@ -1,7 +1,7 @@
 {
   "name": "ligolo-ng-mcp",
-  "version": "1.5.1",
-  "description": "MCP server for ligolo-ng — pivoting over the proxy's authenticated REST control plane, gated by the BITORIA lateral-movement checkpoint",
+  "version": "2.0.0",
+  "description": "MCP server for ligolo-ng — pivoting over the proxy's authenticated REST control plane, with a scope-bound lateral-movement checkpoint and an optional observer WebUI",
   "main": "dist/index.js",
   "type": "module",
   "scripts": {

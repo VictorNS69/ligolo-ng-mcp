@@ -13,17 +13,14 @@
 // ports, workspace, log — kept in a manifest beside the workspace so a
 // second server process (or a later session) can see it.
 //
-// Logs go to `<assessment>/state/ligolo.log`, and `ligolo2.log`,
-// `ligolo3.log`, … for the second and later instances: engagement
-// evidence belongs in the assessment's state tree, not in a workspace
-// scratch dir. With no active assessment they fall back to
-// `<workspace>/ligolo[<n>].log`, because there is no state tree to own
-// them.
+// Logs go to `<workspace>/ligolo.log`, and `ligolo2.log`, `ligolo3.log`, …
+// for the second and later instances (the workspace being the directory of
+// LIGOLO_PROXY_CONFIG).
 
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 
 import { Ledger } from "./ledger.js";
 import { Config, isLoopback, LigoloApi, listenHost, readCreds } from "./ligolo.js";
@@ -39,9 +36,8 @@ export interface InstanceEntry {
   credsPath: string;
   selfcertDir: string;
   workspace: string;
-  /** `<assessment>/state/ligolo[<n>].log`, or the workspace fallback. */
+  /** `<workspace>/ligolo[<n>].log` */
   logPath: string;
-  assessment: string;
   startedAt: string;
 }
 
@@ -54,7 +50,6 @@ export interface ProxyState {
   binary: string | null;
   configPath: string;
   logPath: string;
-  assessment: string;
   /** true when this server owns the process; false for an externally started proxy. */
   managed?: boolean;
   webui: WebUiState;
@@ -155,31 +150,9 @@ export function nameForIndex(index: number): string {
   return `ligolo${suffixForIndex(index)}`;
 }
 
-/**
- * Where this session's assessment keeps its state tree, or null when none is
- * active. `LIGOLO_ASSESSMENT` may be a bare folder name (resolved under
- * `<framework>/assessments/`) or a path.
- */
-export function assessmentStateDir(cfg: Config): string | null {
-  if (cfg.assessment === "") return null;
-  const candidates: string[] = [];
-  if (cfg.assessment.includes("/") || isAbsolute(cfg.assessment)) {
-    candidates.push(cfg.assessment);
-  } else if (cfg.bitoriaRoot !== null) {
-    candidates.push(join(cfg.bitoriaRoot, "assessments", cfg.assessment));
-  }
-  for (const dir of candidates) {
-    const target = join(resolve(dir), "state");
-    if (existsSync(dirname(target)) || existsSync(target)) return target;
-  }
-  return null;
-}
-
-/** Log file for an instance: assessment state tree first, workspace fallback. */
+/** Log file for an instance, in the workspace. */
 export function logFileFor(cfg: Config, index: number): string {
-  const state = assessmentStateDir(cfg);
-  const base = state ?? dirname(cfg.proxyConfig);
-  return join(base, `ligolo${suffixForIndex(index)}.log`);
+  return join(dirname(cfg.proxyConfig), `ligolo${suffixForIndex(index)}.log`);
 }
 
 function manifestPath(cfg: Config): string {
@@ -337,7 +310,7 @@ export function applyPortOverride(cfg: Config, port: string): void {
   cfg.proxyAddr = withPort(cfg.proxyAddr, port);
 }
 
-/** A Config scoped to one instance: same assessment/gate, that instance's ports and files. */
+/** A Config scoped to one instance: same gate, that instance's ports and files. */
 export function instanceConfig(cfg: Config, entry: InstanceEntry): Config {
   const creds = readCreds(entry.credsPath);
   return {
@@ -473,7 +446,6 @@ function stateOf(cfg: Config, spec: InstanceSpec, entry: InstanceEntry | null): 
     binary: cfg.proxyBin,
     configPath: spec.configPath,
     logPath: spec.logPath,
-    assessment: cfg.assessment,
     webui: webUiState(cfg, spec.configPath, spec.apiUrl),
   };
 }
@@ -487,7 +459,7 @@ export async function instanceStatus(cfg: Config, name?: string): Promise<ProxyS
     return { ...stateOf(instanceConfig(cfg, target), spec, target), managed: true };
   }
   // No manifest entry: the proxy may still be up because the operator started
-  // it by hand or through the console wrapper. Ask the configured API rather
+  // it by hand (or in a container). Ask the configured API rather
   // than reporting a stopped instance that is answering requests.
   const spec = planInstance(cfg, name === undefined ? {} : { instance: name });
   let reachable = false;
@@ -499,7 +471,7 @@ export async function instanceStatus(cfg: Config, name?: string): Promise<ProxyS
   }
   // Report the URL this server actually talks to (LIGOLO_API), not the listen
   // address it would plan for a proxy of its own: for a proxy started elsewhere
-  // (a container, the console wrapper) the two differ, and webui.url sent the
+  // (by hand, in a container) the two differ, and webui.url sent the
   // human to a port nothing was serving.
   return {
     ...stateOf(cfg, { ...spec, apiUrl: cfg.apiUrl }, null),
@@ -599,7 +571,6 @@ export async function startProxy(
     selfcertDir: spec.selfcertDir,
     workspace: spec.workspace,
     logPath: spec.logPath,
-    assessment: cfg.assessment,
     startedAt: new Date().toISOString(),
   };
 
@@ -660,6 +631,6 @@ export async function stopProxy(
 }
 
 /** Every live instance, for `ligolo_proxy_status` with no name. */
-export function listInstances(cfg: Config): { entries: InstanceEntry[]; logDir: string | null } {
-  return { entries: liveInstances(cfg), logDir: assessmentStateDir(cfg) };
+export function listInstances(cfg: Config): { entries: InstanceEntry[]; logDir: string } {
+  return { entries: liveInstances(cfg), logDir: dirname(cfg.proxyConfig) };
 }

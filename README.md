@@ -433,6 +433,10 @@ curl -s -H "Authorization: $TOK" http://127.0.0.1:8080/api/v1/agents
 
 Versus upstream 1.0.0:
 
+- 2.0.0: the external-framework integration is removed; `LIGOLO_SCOPE` is the
+  only authorization and the old framework variables (`LIGOLO_ASSESSMENT` and
+  the framework-root path) are ignored. Logs always go to
+  `<workspace>/ligolo[<n>].log`.
 - `ligolo_send_command` is **removed** — it existed to type into the console;
   against the API there is nothing to send. `ligolo_teardown` replaces it.
 - `ligolo_session_select` no longer selects anything: it resolves an agent id
@@ -486,7 +490,7 @@ stderr (captured by the MCP client).
 ```bash
 npm run build     # tsc -> dist/
 npm run dev       # tsc --watch
-npm test          # build, then 64 tests over real MCP stdio against a stub API
+npm test          # build, then 58 tests over real MCP stdio against a stub API
 ```
 
 The suite needs no ligolo binary, no root and no network: it spawns

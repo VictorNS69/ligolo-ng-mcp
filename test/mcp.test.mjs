@@ -22,39 +22,6 @@ const SERVER = resolve(HERE, "..", "dist", "index.js");
 
 // ---------------------------------------------------------------- fixtures
 
-function makeFramework(root, { deny = false } = {}) {
-  const common = join(root, "scripts", "common");
-  mkdirSync(common, { recursive: true });
-  writeFileSync(
-    join(common, "scope_check.py"),
-    [
-      "#!/usr/bin/env python3",
-      "import os, sys",
-      `root = ${JSON.stringify(root)}`,
-      "open(os.path.join(root, 'scope_calls.log'), 'a').write(' '.join(sys.argv[1:]) + '\\n')",
-      "deny = os.path.exists(os.path.join(root, 'deny'))",
-      "if '--checkpoint' not in sys.argv:",
-      "    sys.stderr.write('fixture: checkpoint flag missing\\n'); sys.exit(2)",
-      "if '--confirmed' not in sys.argv and deny:",
-      "    sys.stderr.write('fixture: checkpoint pending human approval\\n'); sys.exit(5)",
-      "sys.exit(0)",
-      "",
-    ].join("\n"),
-  );
-  writeFileSync(
-    join(common, "log_command.sh"),
-    [
-      "#!/usr/bin/env bash",
-      `printf '%s\\n' "$*" >> ${JSON.stringify(join(root, "commands.log"))}`,
-      "",
-    ].join("\n"),
-  );
-  chmodSync(join(common, "scope_check.py"), 0o755);
-  chmodSync(join(common, "log_command.sh"), 0o755);
-  if (deny) writeFileSync(join(root, "deny"), "1\n");
-  return root;
-}
-
 function makeCerts(dir, domain = "ligolo") {
   mkdirSync(dir, { recursive: true });
   const key = join(dir, "key.pem");
@@ -245,42 +212,14 @@ class McpClient {
 // ---------------------------------------------------------------- harness
 
 async function startServer({
-  deny = false,
   readOnly = false,
   certDomain = "ligolo",
-  assessment = "test-assessment",
-  markerAssessment = null,
-  markerAgeHours = 0,
   password = "testpass",
-  mcpFlag = true,
-  standaloneScope = "",
+  // The default authorization covers every target these tests pivot to.
+  scope = "10.0.0.0/8,172.16.0.0/12",
   env: extraEnv = {},
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), "ligolo-mcp-"));
-  const framework = makeFramework(join(root, "framework"), { deny });
-  // The assessment's scope.yaml decides whether the MCP server is allowed for
-  // this engagement at all (`ligolo.mcp`, off by default like the Burp block).
-  const assessmentDir = join(framework, "assessments", "test-assessment", "state");
-  mkdirSync(assessmentDir, { recursive: true });
-  writeFileSync(
-    join(framework, "assessments", "test-assessment", "scope.yaml"),
-    mcpFlag === null
-      ? "in_scope:\n  hosts: ['10.0.0.0/8']\n"
-      : `in_scope:\n  hosts: ['10.0.0.0/8']\nligolo:\n  mcp: ${mcpFlag ? "true" : "false"}\n`,
-  );
-  if (markerAssessment) {
-    const stamp = new Date(Date.now() - markerAgeHours * 3_600_000).toISOString().replace(/\.\d+Z$/, "Z");
-    mkdirSync(join(framework, "assessments", markerAssessment), { recursive: true });
-    writeFileSync(
-      join(framework, "assessments", markerAssessment, "scope.yaml"),
-      `in_scope:\n  hosts: ['10.0.0.0/8']\nligolo:\n  mcp: ${mcpFlag === false ? "false" : "true"}\n`,
-    );
-    mkdirSync(join(framework, "state"), { recursive: true });
-    writeFileSync(
-      join(framework, "state", "assessment-scope.json"),
-      JSON.stringify({ assessment: markerAssessment, updated_at: stamp }, null, 2),
-    );
-  }
   const certDir = join(root, "ligolo-selfcerts");
   const cert = makeCerts(certDir, certDomain);
   const { server, state } = makeApi();
@@ -296,13 +235,11 @@ async function startServer({
       LIGOLO_API: `http://127.0.0.1:${port}`,
       LIGOLO_USER: "ligolo",
       LIGOLO_PASSWORD: password,
-      LIGOLO_ASSESSMENT: assessment ?? "",
-      LIGOLO_BITORIA_ROOT: framework,
       LIGOLO_SELFCERT_DIR: certDir,
       LIGOLO_SELFCERT_DOMAIN: certDomain,
       LIGOLO_PROXY_CONFIG: join(workdir, "ligolo-ng.yaml"),
       LIGOLO_MCP_READ_ONLY: readOnly ? "1" : "",
-      LIGOLO_SCOPE: standaloneScope,
+      LIGOLO_SCOPE: scope,
       LIGOLO_NG_DIR: "",
       LIGOLO_PROXY_BIN: "",
       ...extraEnv,
@@ -315,7 +252,7 @@ async function startServer({
     child.kill("SIGKILL");
     await new Promise((r) => server.close(r));
   };
-  return { client, state, tools, framework, cert, cleanup, workdir };
+  return { client, state, tools, cert, cleanup, workdir };
 }
 
 /**
@@ -418,8 +355,8 @@ describe("agent introspection", () => {
 });
 
 describe("lateral-movement gate", () => {
-  it("refuses a denied tunnel start without touching the API", async () => {
-    const h = await startServer({ deny: true });
+  it("refuses an unconfirmed tunnel start without touching the API", async () => {
+    const h = await startServer();
     try {
       const { isError, payload } = await h.client.call("ligolo_tunnel_start", {
         agentId: "1",
@@ -430,15 +367,12 @@ describe("lateral-movement gate", () => {
       assert.equal(payload.action_taken, false);
       assert.equal(payload.exit_code, 5);
       assert.deepEqual(mutatingCalls(h.state), [], "no mutating HTTP request may leave the process");
-      const log = readFileSync(join(h.framework, "scope_calls.log"), "utf8");
-      assert.match(log, /--technique lateral --checkpoint/);
-      assert.doesNotMatch(log, /--confirmed/);
     } finally {
       await h.cleanup();
     }
   });
 
-  it("passes target + --confirmed when the checkpoint is cleared", async () => {
+  it("lets a confirmed, in-scope route through with the exact body", async () => {
     const h = await startServer();
     try {
       const { isError, payload } = await h.client.call("ligolo_route_add", {
@@ -448,12 +382,8 @@ describe("lateral-movement gate", () => {
       });
       assert.equal(isError, false);
       assert.equal(payload.scope_checked, true);
-      const log = readFileSync(join(h.framework, "scope_calls.log"), "utf8");
-      assert.match(log, /172\.16\.5\.9 --assessment test-assessment --technique lateral --checkpoint --confirmed/);
       const post = mutatingCalls(h.state).find((c) => c.path === "/api/v1/routes" && c.method === "POST");
       assert.deepEqual(post.body, { Interface: "ligolo", Route: ["172.16.5.0/24"] });
-      const audit = readFileSync(join(h.framework, "commands.log"), "utf8");
-      assert.match(audit, /ligolo_route_add instance=ligolo 172\.16\.5\.0\/24 dev ligolo/);
     } finally {
       await h.cleanup();
     }
@@ -471,13 +401,14 @@ describe("lateral-movement gate", () => {
     }
   });
 
-  it("derives the target from a /32 route", async () => {
-    const h = await startServer();
+  it("derives the target from a /32 route, and checks it against the scope", async () => {
+    const h = await startServer({ scope: "10.10.10.5" });
     try {
-      const { isError } = await h.client.call("ligolo_route_add", { network: "10.10.10.5/32", confirmed: true });
-      assert.equal(isError, false);
-      const log = readFileSync(join(h.framework, "scope_calls.log"), "utf8");
-      assert.match(log, /10\.10\.10\.5 --assessment/);
+      const inside = await h.client.call("ligolo_route_add", { network: "10.10.10.5/32", confirmed: true });
+      assert.equal(inside.isError, false, JSON.stringify(inside.payload));
+      const outside = await h.client.call("ligolo_route_add", { network: "10.10.10.6/32", confirmed: true });
+      assert.equal(outside.isError, true);
+      assert.equal(outside.payload.exit_code, 3);
     } finally {
       await h.cleanup();
     }
@@ -526,7 +457,7 @@ describe("tunnel and listener operations", () => {
         RedirectAddr: "127.0.0.1:443",
         Network: "tcp",
       });
-      assert.match(payload.cleanup, /state\/cleanup-pending\.md/);
+      assert.match(payload.cleanup, /Track for cleanup: listener 0\.0\.0\.0:4444 -> 127\.0\.0\.1:443 .*ligolo_listener_delete/);
     } finally {
       await h.cleanup();
     }
@@ -647,41 +578,6 @@ describe("proxy lifecycle", () => {
   });
 });
 
-describe("assessment resolution", () => {
-  it("falls back to the framework's own active-assessment marker", async () => {
-    const h = await startServer({ assessment: "", markerAssessment: "marker-assessment" });
-    try {
-      const { isError, payload } = await h.client.call("ligolo_route_add", {
-        network: "172.16.5.0/24",
-        target: "172.16.5.9",
-        confirmed: true,
-      });
-      assert.equal(isError, false, JSON.stringify(payload));
-      const log = readFileSync(join(h.framework, "scope_calls.log"), "utf8");
-      assert.match(log, /--assessment marker-assessment/);
-    } finally {
-      await h.cleanup();
-    }
-  });
-
-  it("treats a stale marker as no assessment (same 12h TTL as the filesystem guard)", async () => {
-    const h = await startServer({ assessment: "", markerAssessment: "stale-assessment", markerAgeHours: 48 });
-    try {
-      const { isError, payload } = await h.client.call("ligolo_route_add", {
-        network: "10.10.10.0/24",
-        target: "10.10.10.5",
-        confirmed: true,
-      });
-      assert.equal(isError, true);
-      assert.equal(payload.exit_code, 4);
-      assert.match(payload.message, /no authorization source configured/);
-      assert.deepEqual(mutatingCalls(h.state), []);
-    } finally {
-      await h.cleanup();
-    }
-  });
-});
-
 describe("credential seeding", () => {
   it("generates a 0600 credential file when no password is supplied", async () => {
     const { loadConfig } = await import("../dist/ligolo.js");
@@ -693,8 +589,6 @@ describe("credential seeding", () => {
         LIGOLO_SELFCERT_DIR: join(root, "ligolo-selfcerts"),
         LIGOLO_USER: "ligolo",
         LIGOLO_PASSWORD: "",
-        LIGOLO_BITORIA_ROOT: "",
-        LIGOLO_ASSESSMENT: "",
       },
       root,
     );
@@ -749,27 +643,24 @@ describe("agent-facing port override", () => {
 });
 
 describe("log placement", () => {
-  const mkCfg = async (root, extra = {}) => {
+  const mkCfg = async (root) => {
     const { loadConfig } = await import("../dist/ligolo.js");
-    mkdirSync(join(root, "assessments", "test-assessment", "state"), { recursive: true });
     return loadConfig(
       {
         LIGOLO_PROXY_CONFIG: join(root, "ws", "ligolo-ng.yaml"),
         LIGOLO_SELFCERT_DIR: join(root, "ws", "ligolo-selfcerts"),
-        LIGOLO_ASSESSMENT: "test-assessment",
-        LIGOLO_BITORIA_ROOT: root,
-        ...extra,
       },
       root,
     );
   };
 
-  it("writes the proxy log into the assessment state tree", async () => {
+  it("writes the proxy log into the workspace", async () => {
     const root = mkdtempSync(join(tmpdir(), "ligolo-log-"));
     const cfg = await mkCfg(root);
     const { planInstance } = await import("../dist/proxy.js");
     const spec = planInstance(cfg, {});
-    assert.equal(spec.logPath, join(root, "assessments", "test-assessment", "state", "ligolo.log"));
+    assert.equal(spec.logPath, join(root, "ws", "ligolo.log"));
+    assert.equal(spec.name, "ligolo");
   });
 
   it("numbers a second instance ligolo2.log and shifts both ports", async () => {
@@ -789,7 +680,7 @@ describe("log placement", () => {
           name: "ligolo", index: 1, pid: proxy1.pid,
           apiUrl: "http://127.0.0.1:8080", proxyAddr: "0.0.0.0:11601",
           configPath: first.configPath, credsPath: first.credsPath, selfcertDir: first.selfcertDir,
-          workspace: first.workspace, logPath: first.logPath, assessment: "test-assessment",
+          workspace: first.workspace, logPath: first.logPath,
           startedAt: new Date().toISOString(),
         },
       }),
@@ -797,38 +688,12 @@ describe("log placement", () => {
     const second = planInstance(cfg, {});
     assert.equal(second.name, "ligolo2");
     assert.equal(second.index, 2);
-    assert.equal(second.logPath, join(root, "assessments", "test-assessment", "state", "ligolo2.log"));
+    assert.equal(second.logPath, join(root, "ws", "ligolo2.log"));
     assert.equal(second.proxyAddr, "0.0.0.0:11602", "agent port must not collide with instance 1");
     assert.equal(second.apiUrl, "http://127.0.0.1:8081", "API port must not collide with instance 1");
     assert.equal(second.configPath, join(root, "ws", "ligolo2", "ligolo-ng.yaml"), "own workspace per instance");
     const third = planInstance(cfg, { instance: "ligolo3" });
-    assert.equal(third.logPath, join(root, "assessments", "test-assessment", "state", "ligolo3.log"));
-  });
-
-  it("falls back to the workspace when no assessment is active", async () => {
-    const root = mkdtempSync(join(tmpdir(), "ligolo-log3-"));
-    const { loadConfig } = await import("../dist/ligolo.js");
-    const { planInstance } = await import("../dist/proxy.js");
-    const cfg = loadConfig(
-      {
-        LIGOLO_PROXY_CONFIG: join(root, "ws", "ligolo-ng.yaml"),
-        LIGOLO_SELFCERT_DIR: join(root, "ws", "ligolo-selfcerts"),
-        LIGOLO_ASSESSMENT: "",
-        LIGOLO_BITORIA_ROOT: "",
-      },
-      root,
-    );
-    assert.equal(planInstance(cfg, {}).logPath, join(root, "ws", "ligolo.log"));
-    assert.equal(planInstance(cfg, { instance: "ligolo2" }).logPath, join(root, "ws", "ligolo2.log"));
-  });
-
-  it("reports the log path and instance in proxy_start's payload shape", async () => {
-    const root = mkdtempSync(join(tmpdir(), "ligolo-log4-"));
-    const cfg = await mkCfg(root);
-    const { planInstance } = await import("../dist/proxy.js");
-    const spec = planInstance(cfg, {});
-    assert.match(spec.logPath, /assessments\/test-assessment\/state\/ligolo\.log$/);
-    assert.equal(spec.name, "ligolo");
+    assert.equal(third.logPath, join(root, "ws", "ligolo3.log"));
   });
 });
 
@@ -868,7 +733,6 @@ describe("instances", () => {
           selfcertDir: join(h.workdir, "ligolo2", "ligolo-selfcerts"),
           workspace: join(h.workdir, "ligolo2"),
           logPath: join(h.workdir, "ligolo2.log"),
-          assessment: "test-assessment",
           startedAt: new Date().toISOString(),
         },
       };
@@ -905,44 +769,9 @@ describe("instances", () => {
 });
 
 describe("authorization sources", () => {
-  it("refuses when the assessment has no ligolo block (off by default)", async () => {
-    const h = await startServer({ mcpFlag: null });
-    try {
-      const { isError, payload } = await h.client.call("ligolo_route_add", {
-        network: "172.16.5.0/24",
-        target: "172.16.5.9",
-        confirmed: true,
-      });
-      assert.equal(isError, true);
-      assert.equal(payload.exit_code, 4);
-      assert.match(payload.message, /not enabled for assessment test-assessment/);
-      assert.match(payload.message, /off by default/);
-      assert.deepEqual(mutatingCalls(h.state), []);
-    } finally {
-      await h.cleanup();
-    }
-  });
-
-  it("refuses when the assessment sets ligolo.mcp: false", async () => {
-    const h = await startServer({ mcpFlag: false });
-    try {
-      const { isError, payload } = await h.client.call("ligolo_tunnel_start", {
-        agentId: "1",
-        target: "10.0.0.5",
-        confirmed: true,
-      });
-      assert.equal(isError, true);
-      assert.match(payload.message, /`ligolo\.mcp: false`/);
-      assert.deepEqual(mutatingCalls(h.state), []);
-    } finally {
-      await h.cleanup();
-    }
-  });
-
-  it("works standalone: LIGOLO_SCOPE + confirmed authorizes an in-scope target", async () => {
+  it("LIGOLO_SCOPE + confirmed authorizes an in-scope target", async () => {
     const h = await startServer({
-      assessment: "",
-      standaloneScope: "172.16.5.0/24,10.10.10.5",
+      scope: "172.16.5.0/24,10.10.10.5",
     });
     try {
       const { isError, payload } = await h.client.call("ligolo_route_add", {
@@ -959,8 +788,8 @@ describe("authorization sources", () => {
     }
   });
 
-  it("still requires the human confirmation in standalone mode", async () => {
-    const h = await startServer({ assessment: "", standaloneScope: "172.16.5.0/24" });
+  it("still requires the human confirmation for an in-scope target", async () => {
+    const h = await startServer({ scope: "172.16.5.0/24" });
     try {
       const { isError, payload } = await h.client.call("ligolo_route_add", {
         network: "172.16.5.0/24",
@@ -975,8 +804,8 @@ describe("authorization sources", () => {
     }
   });
 
-  it("refuses a standalone target outside LIGOLO_SCOPE, even when confirmed", async () => {
-    const h = await startServer({ assessment: "", standaloneScope: "10.10.10.0/24" });
+  it("refuses a target outside LIGOLO_SCOPE, even when confirmed", async () => {
+    const h = await startServer({ scope: "10.10.10.0/24" });
     try {
       const { isError, payload } = await h.client.call("ligolo_route_add", {
         network: "10.9.9.0/24",
@@ -992,8 +821,8 @@ describe("authorization sources", () => {
     }
   });
 
-  it("explains both authorization sources when neither is configured", async () => {
-    const h = await startServer({ assessment: "", standaloneScope: "" });
+  it("says what to set when no authorization is configured", async () => {
+    const h = await startServer({ scope: "" });
     try {
       const { isError, payload } = await h.client.call("ligolo_listener_add", {
         localAddress: "0.0.0.0:4444",
@@ -1004,15 +833,15 @@ describe("authorization sources", () => {
       });
       assert.equal(isError, true);
       assert.equal(payload.exit_code, 4);
-      assert.match(payload.message, /LIGOLO_SCOPE/);
-      assert.match(payload.message, /BITORIA assessment/);
+      assert.match(payload.message, /no authorization source configured: set LIGOLO_SCOPE/);
+      assert.deepEqual(mutatingCalls(h.state), []);
     } finally {
       await h.cleanup();
     }
   });
 
   it("keeps read-only tools working with no authorization at all", async () => {
-    const h = await startServer({ assessment: "", standaloneScope: "" });
+    const h = await startServer({ scope: "" });
     try {
       const { isError } = await h.client.call("ligolo_agents_list");
       assert.equal(isError, false);
@@ -1133,8 +962,6 @@ describe("observer WebUI", () => {
         LIGOLO_SELFCERT_DIR: join(root, "ligolo-selfcerts"),
         LIGOLO_USER: "ligolo",
         LIGOLO_PASSWORD: "agentpw",
-        LIGOLO_BITORIA_ROOT: "",
-        LIGOLO_ASSESSMENT: "",
         LIGOLO_WEBUI: "1",
         LIGOLO_WEBUI_PASSWORD: "human-secret-pw",
         ...extra,
@@ -1238,7 +1065,7 @@ describe("observer WebUI", () => {
 });
 
 describe("changes made outside the MCP", () => {
-  const scoped = { standaloneScope: "10.0.0.0/8,172.16.0.0/12", assessment: "" };
+  const scoped = { scope: "10.0.0.0/8,172.16.0.0/12" };
 
   it("labels routes by origin and reports MCP routes removed elsewhere", async () => {
     const h = await startServer(scoped);
@@ -1334,7 +1161,6 @@ describe("regressions", () => {
       assert.equal(isError, true);
       assert.match(payload.message, /not available: this server runs read-only/);
       assert.deepEqual(mutatingCalls(h.state), []);
-      assert.equal(existsSync(join(h.framework, "scope_calls.log")), false, "the gate must not even run");
     } finally {
       await h.cleanup();
     }
@@ -1392,7 +1218,7 @@ describe("regressions", () => {
             name: "ligolo", index: 1, pid: bystander.pid, apiUrl: "http://127.0.0.1:1", proxyAddr: "0.0.0.0:11601",
             configPath: join(h.workdir, "ligolo-ng.yaml"), credsPath: join(h.workdir, ".ligolo-mcp-credentials"),
             selfcertDir: join(h.workdir, "ligolo-selfcerts"), workspace: h.workdir, logPath: join(h.workdir, "ligolo.log"),
-            assessment: "test-assessment", startedAt: new Date().toISOString(),
+            startedAt: new Date().toISOString(),
           },
         }),
       );
@@ -1438,7 +1264,7 @@ describe("regressions", () => {
   });
 
   it("refuses an interface name Linux rejects, before the proxy registers it", async () => {
-    const h = await startServer({ standaloneScope: "10.0.0.0/8", assessment: "" });
+    const h = await startServer({ scope: "10.0.0.0/8" });
     try {
       for (const [tool, args] of [
         ["ligolo_interface_create", { name: "test desde ui" }],
@@ -1456,7 +1282,7 @@ describe("regressions", () => {
   });
 
   it("never moves a running tunnel to another interface (ligolo orphans the TUN)", async () => {
-    const h = await startServer({ standaloneScope: "10.0.0.0/8", assessment: "" });
+    const h = await startServer({ scope: "10.0.0.0/8" });
     try {
       h.state.agents[1].Running = true;
       h.state.agents[1].Interface = "ligolo";
@@ -1473,7 +1299,7 @@ describe("regressions", () => {
   });
 
   it("explains a TUN the proxy itself still holds", async () => {
-    const h = await startServer({ standaloneScope: "10.0.0.0/8", assessment: "" });
+    const h = await startServer({ scope: "10.0.0.0/8" });
     try {
       const { isError, payload } = await h.client.call("ligolo_tunnel_start", { agentId: "1", tun: "heldtun", target: "10.0.0.5", confirmed: true });
       assert.equal(isError, true);
@@ -1485,7 +1311,7 @@ describe("regressions", () => {
 
   it("derives the default API URL from LIGOLO_API_LISTEN", async () => {
     const { loadConfig } = await import("../dist/ligolo.js");
-    const base = { LIGOLO_BITORIA_ROOT: "", LIGOLO_ASSESSMENT: "" };
+    const base = {};
     assert.equal(loadConfig({ ...base }, process.cwd()).apiUrl, "http://127.0.0.1:8080");
     assert.equal(loadConfig({ ...base, LIGOLO_API_LISTEN: "127.0.0.1:9090" }, process.cwd()).apiUrl, "http://127.0.0.1:9090");
     assert.equal(loadConfig({ ...base, LIGOLO_API_LISTEN: "0.0.0.0:9090" }, process.cwd()).apiUrl, "http://127.0.0.1:9090");
@@ -1502,8 +1328,7 @@ describe("credential precedence", () => {
   const entryFor = (root) => ({
     name: "ligolo", index: 1, pid: 1, apiUrl: "http://127.0.0.1:8080", proxyAddr: "0.0.0.0:11601",
     configPath: join(root, "ligolo-ng.yaml"), credsPath: join(root, ".ligolo-mcp-credentials"),
-    selfcertDir: join(root, "ligolo-selfcerts"), workspace: root, logPath: join(root, "ligolo.log"),
-    assessment: "", startedAt: new Date().toISOString(),
+    selfcertDir: join(root, "ligolo-selfcerts"), workspace: root, logPath: join(root, "ligolo.log"), startedAt: new Date().toISOString(),
   });
 
   it("LIGOLO_PASSWORD and LIGOLO_USER win over .ligolo-mcp-credentials", async () => {
@@ -1512,7 +1337,7 @@ describe("credential precedence", () => {
     const root = mkdtempSync(join(tmpdir(), "ligolo-prec1-"));
     writeFileSync(join(root, ".ligolo-mcp-credentials"), JSON.stringify({ user: "fileuser", password: "filepw" }));
     const cfg = loadConfig(
-      { LIGOLO_PROXY_CONFIG: join(root, "ligolo-ng.yaml"), LIGOLO_USER: "envuser", LIGOLO_PASSWORD: "envpw", LIGOLO_BITORIA_ROOT: "" },
+      { LIGOLO_PROXY_CONFIG: join(root, "ligolo-ng.yaml"), LIGOLO_USER: "envuser", LIGOLO_PASSWORD: "envpw" },
       root,
     );
     assert.equal(cfg.password, "envpw");
@@ -1527,7 +1352,7 @@ describe("credential precedence", () => {
     const root = mkdtempSync(join(tmpdir(), "ligolo-prec2-"));
     writeFileSync(join(root, ".ligolo-mcp-credentials"), JSON.stringify({ user: "fileuser", password: "filepw" }));
     const cfg = loadConfig(
-      { LIGOLO_PROXY_CONFIG: join(root, "ligolo-ng.yaml"), LIGOLO_USER: "", LIGOLO_PASSWORD: "", LIGOLO_BITORIA_ROOT: "" },
+      { LIGOLO_PROXY_CONFIG: join(root, "ligolo-ng.yaml"), LIGOLO_USER: "", LIGOLO_PASSWORD: "" },
       root,
     );
     const scoped = instanceConfig(cfg, entryFor(root));

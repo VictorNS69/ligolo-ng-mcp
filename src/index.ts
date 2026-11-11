@@ -8,8 +8,8 @@
 // and therefore could not move a packet (see README §Why this fork).
 //
 // Reachability-changing tools (tunnel start, route add, listener add)
-// run the framework's lateral-movement hard checkpoint first and refuse
-// to touch the API when it denies. See src/ligolo.ts.
+// pass the lateral-movement gate first (target inside LIGOLO_SCOPE +
+// confirmed) and refuse to touch the API when it denies. See src/ligolo.ts.
 //
 // LIGOLO_MCP_READ_ONLY=1 registers only the read-only half; every failure
 // comes back as JSON with isError, so a refused checkpoint is never
@@ -30,7 +30,6 @@ import {
   GateError,
   LigoloApi,
   loadConfig,
-  logCommand,
   requireAgent,
   AgentRecord,
   ListenerRecord,
@@ -75,14 +74,9 @@ function num(args: Args, key: string): number | null {
   return null;
 }
 
-/** A gated mutation: checkpoint first, then act, then record. */
-function gate(target: string, confirmed: boolean, summary: string): void {
+/** A gated mutation: the checkpoint runs before anything is sent. */
+function gate(target: string, confirmed: boolean): void {
   assertScope(cfg, target, confirmed);
-  logCommand(cfg, summary);
-}
-
-function log(summary: string): void {
-  logCommand(cfg, summary);
 }
 
 /**
@@ -132,15 +126,15 @@ async function outsideMcp(c: Config, api: LigoloApi): Promise<Payload> {
 const TARGET = {
   type: "string",
   description:
-    "In-scope host/address behind the pivot that this action makes reachable. Required by the lateral-movement " +
-    "hard checkpoint (scope_check.py); visible-but-unlisted networks are still out of scope.",
+    "In-scope host/address behind the pivot that this action makes reachable. It must be inside LIGOLO_SCOPE; " +
+    "visible-but-unlisted networks are still out of scope.",
 } as const;
 
 const CONFIRMED = {
   type: "boolean",
   description:
-    "Set true only after a human approved this pivot and it is recorded in state/decisions.md. Never set it " +
-    "speculatively: scope_check.py exits 5 until the checkpoint is genuinely cleared.",
+    "Set true only after a human approved this pivot. Never set it speculatively: the gate answers exit 5 until " +
+    "the checkpoint is genuinely cleared.",
   default: false,
 } as const;
 
@@ -378,7 +372,7 @@ const writeTools: Tool[] = [
     name: "ligolo_listener_add",
     description:
       "Add a listener on the agent that relays back to the operator (reverse shell catch, payload serving). GATED: " +
-      "a listener is a resident artifact on a client host and must also be recorded in state/cleanup-pending.md.",
+      "a listener is a resident artifact on a client host — track it for cleanup.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -430,7 +424,7 @@ const writeTools: Tool[] = [
 ];
 
 /** Single source for the version reported over MCP and in the startup banner. */
-const VERSION = "1.5.1";
+const VERSION = "2.0.0";
 
 const tools: Tool[] = cfg.readOnly ? readTools : [...readTools, ...writeTools];
 
@@ -544,7 +538,6 @@ async function handleProxyStart(args: Args): Promise<Payload> {
       } catch (err) {
         fingerprintError = err instanceof Error ? err.message : String(err);
       }
-      log(`ligolo_proxy_start reuse=true instance=${existing.instance} pid=${existing.pid ?? "none"}`);
       return {
         ...existing,
         reused: true,
@@ -560,10 +553,6 @@ async function handleProxyStart(args: Args): Promise<Payload> {
     apiPort: str(args, "apiPort"),
     rewriteConfig: bool(args, "rewriteConfig", false),
   });
-  log(
-    `ligolo_proxy_start instance=${state.instance} api=${state.apiUrl} ` +
-      `binary=${state.binary ?? "<missing>"} log=${state.logPath}`,
-  );
   let fingerprint: string | null = null;
   let fingerprintError: string | null = null;
   try {
@@ -657,11 +646,7 @@ async function handleTunnelStart(args: Args): Promise<Payload> {
         "Nothing was sent to the proxy.",
     );
   }
-  gate(
-    target,
-    bool(args, "confirmed", false),
-    `ligolo_tunnel_start instance=${instance} agent=${agentId} (${agent.Name}) tun=${tun} target=${target}`,
-  );
+  gate(target, bool(args, "confirmed", false));
   const interfaces = await api.interfaces();
   let interfaceCreated = false;
   if (!(tun in (interfaces ?? {}))) {
@@ -684,7 +669,7 @@ async function handleTunnelStart(args: Args): Promise<Payload> {
     routed: (await api.interfaces())?.[tun]?.Routes ?? [],
     next:
       "Route the segment onto the interface (ligolo_route_add) if it is not already listed, then scan through the " +
-      "tun. Every newly reachable in-scope host belongs in state/hosts.md.",
+      "tun.",
   };
 }
 
@@ -708,7 +693,7 @@ async function handleRouteAdd(args: Args): Promise<Payload> {
         "evaluated against something real (visible != authorized).",
     );
   }
-  gate(target, bool(args, "confirmed", false), `ligolo_route_add instance=${instance} ${network} dev ${iface} target=${target}`);
+  gate(target, bool(args, "confirmed", false));
   let applied: { message: string };
   try {
     applied = await api.addRoutes(iface, [network]);
@@ -770,11 +755,7 @@ async function handleListenerAdd(args: Args): Promise<Payload> {
     );
   }
   const agent = await requireAgent(api, agentId);
-  gate(
-    target,
-    bool(args, "confirmed", false),
-    `ligolo_listener_add instance=${instance} agent=${agentId} addr=${local} to=${remote} network=${network} target=${target}`,
-  );
+  gate(target, bool(args, "confirmed", false));
   const created = await api.createListener(agentId, local, remote, network);
   const listeners = (await api.listeners()) ?? [];
   const mine = listeners.filter((l: ListenerRecord) => String(l.AgentID) === agentId && l.ListenerAddr === local);
@@ -790,7 +771,7 @@ async function handleListenerAdd(args: Args): Promise<Payload> {
     message: created.message,
     listener: mine[0] ?? null,
     cleanup:
-      `Record in state/cleanup-pending.md: listener ${local} -> ${remote} (${network}) on agent ${agentId}; ` +
+      `Track for cleanup: listener ${local} -> ${remote} (${network}) on agent ${agentId}; ` +
       `revert with ligolo_listener_delete {listenerId: ${mine[0]?.ListenerID ?? "<id>"}, agentId: "${agentId}"}.`,
   };
 }
@@ -800,7 +781,6 @@ async function handleTeardown(args: Args): Promise<Payload> {
   const agentId = str(args, "agentId");
   const iface = str(args, "interface", c.interfaceName);
   const deleteInterface = bool(args, "deleteInterface", false);
-  log(`ligolo_teardown instance=${instance} agent=${agentId} interface=${iface} delete_interface=${deleteInterface}`);
   const steps: Payload[] = [];
   const attempt = async (label: string, fn: () => Promise<unknown>): Promise<void> => {
     try {
@@ -863,8 +843,7 @@ async function handleTeardown(args: Args): Promise<Payload> {
     agent_id: agentId,
     steps,
     note:
-      "Resolve state/cleanup-pending.md entries for this pivot (uploaded agent binary, listeners) and delete the " +
-      "agent binary on the foothold; the API cannot unlink files on the client.",
+      "Delete the uploaded agent binary on the foothold yourself; the API cannot unlink files on the client.",
   };
 }
 
@@ -887,7 +866,6 @@ async function handleToolCall(name: string, args: Args): Promise<Payload> {
     case "ligolo_proxy_stop": {
       const wanted = str(args, "instance");
       const state = await stopProxy(cfg, wanted);
-      log(`ligolo_proxy_stop instance=${state.instance} pid=${state.stoppedPid ?? "none"} running=${state.running}`);
       return { ...state, scope_checked: false };
     }
     case "ligolo_proxy_status": {
@@ -936,7 +914,6 @@ async function handleToolCall(name: string, args: Args): Promise<Payload> {
       const { c, api, instance } = ctx(args);
       const iface = str(args, "name", c.interfaceName);
       assertInterfaceName(iface);
-      log(`ligolo_interface_create instance=${instance} ${iface}`);
       const created = await api.createInterface(iface);
       track(c, (l) => l.record("interface", keys.interface(iface)));
       return {
@@ -983,7 +960,6 @@ async function handleToolCall(name: string, args: Args): Promise<Payload> {
     case "ligolo_tunnel_stop": {
       const { c, api, instance } = ctx(args);
       const agentId = str(args, "agentId");
-      log(`ligolo_tunnel_stop instance=${instance} agent=${agentId}`);
       const session = (await api.agents().catch(() => null))?.[agentId]?.SessionID;
       const stopped = await api.stopTunnel(agentId);
       if (session !== undefined) track(c, (l) => l.forget("tunnel", keys.tunnel(session)));
@@ -995,7 +971,6 @@ async function handleToolCall(name: string, args: Args): Promise<Payload> {
       const { c, api, instance } = ctx(args);
       const network = str(args, "network");
       const iface = str(args, "interface", c.interfaceName);
-      log(`ligolo_route_delete instance=${instance} ${network} dev ${iface}`);
       const removed = await api.deleteRoute(iface, network);
       track(c, (l) => l.forget("route", keys.route(iface, network)));
       return { scope_checked: false, instance, network, interface: iface, message: removed.message };
@@ -1046,7 +1021,6 @@ async function handleToolCall(name: string, args: Args): Promise<Payload> {
       const agentId = str(args, "agentId");
       if (listenerId === null) throw new Error("listenerId is required (from ligolo_listener_list)");
       if (agentId === "") throw new Error("agentId is required — listeners are addressed per agent");
-      log(`ligolo_listener_delete instance=${instance} agent=${agentId} listener=${listenerId}`);
       const forgetIt = (): void =>
         track(c, (l) =>
           l.forgetWhere((e) => e.kind === "listener" && e.listenerId === listenerId && e.agentId === Number(agentId)),
@@ -1110,7 +1084,7 @@ async function handleToolCall(name: string, args: Args): Promise<Payload> {
         warning: debugIgnore
           ? "-ignore-cert accepts any MITM between foothold and operator. Debug only; re-issue without debugIgnoreCert."
           : null,
-        cleanup: "Log the uploaded agent binary in state/cleanup-pending.md the moment it lands on the foothold.",
+        cleanup: "Track the uploaded agent binary for cleanup the moment it lands on the foothold.",
       };
     }
     case "ligolo_teardown":
@@ -1159,10 +1133,10 @@ async function main(): Promise<void> {
   // stdout is the MCP stream; diagnostics go to stderr only.
   console.error(
     `ligolo-ng-mcp ${VERSION} ready — api=${cfg.apiUrl} ` +
-      `assessment=${cfg.assessment || "<unset>"}(${cfg.assessmentSource}) ` +
-      `read_only=${cfg.readOnly} tools=${tools.length} framework=${cfg.bitoriaRoot ?? "<not found>"} ` +
+      `scope=${cfg.scope.length === 0 ? "<unset: mutating tools refuse>" : cfg.scope.join(",")} ` +
+      `read_only=${cfg.readOnly} tools=${tools.length} ` +
       `webui=${cfg.webUi ? `on(user=${cfg.webUiUser})` : "off"} ` +
-      `logs=${cfg.assessment === "" ? "<workspace>/ligolo[<n>].log" : `assessments/${cfg.assessment}/state/ligolo[<n>].log`}`,
+      "logs=<workspace>/ligolo[<n>].log",
   );
 }
 

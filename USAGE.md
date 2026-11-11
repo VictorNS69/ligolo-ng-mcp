@@ -15,8 +15,8 @@ server](#register-the-server) · [Walkthrough: one pivot](#walkthrough-one-pivot
 [Agent-localhost services](#agent-localhost-services) · [Double pivot](#double-pivot) ·
 [Read-only mode](#read-only-mode) · [Logs and multiple
 instances](#logs-and-multiple-instances) · [Teardown and cleanup](#teardown-and-cleanup) ·
-[Running outside BITORIA](#running-outside-bitoria) ·
-[Reading the responses](#reading-the-responses) · [Raw API by hand](#raw-api-by-hand)
+[The gate](#the-gate) · [Reading the responses](#reading-the-responses) ·
+[Raw API by hand](#raw-api-by-hand)
 
 ## Before the first call
 
@@ -24,14 +24,10 @@ instances](#logs-and-multiple-instances) · [Teardown and cleanup](#teardown-and
 |---|---|---|
 | ligolo-ng release (proxy **and** agent) | the server drives the proxy, the agent runs on the foothold | `LIGOLO_NG_DIR=/opt/ligolo-ng` → `ls $LIGOLO_NG_DIR/{proxy,agent,agent.exe}` |
 | TUN privileges on the operator host | the proxy creates the interface; the agent needs none | `sudo -v` then `ip tuntap add user $USER mode tun test0 && ip link del test0` |
-| a workspace directory | the proxy writes its config, certs, log and pid file there | e.g. `~/.ligolo-workspace/` |
-| a framework checkout with the lateral checkpoint | the three reachability-changing tools refuse to run without it | `ls <root>/scripts/common/scope_check.py` |
-| an active assessment | the gate reads its `scope.yaml` | `pentest status <assessment>` or `cat <root>/state/assessment-scope.json` |
+| a workspace directory | the proxy writes its config, certs and log there | e.g. `~/.ligolo-workspace/` |
+| `LIGOLO_SCOPE` | the three reachability-changing tools refuse without it | the hosts/CIDRs you are authorized to reach, e.g. `10.10.10.0/24,172.16.5.9` |
 
-The server auto-detects the framework root by walking up from its working
-directory; set `LIGOLO_BITORIA_ROOT` when it is somewhere else, and
-`LIGOLO_ASSESSMENT` when the active-assessment marker is stale or you want a
-specific engagement.
+That is all: no Python, no shell wrappers, no external framework.
 
 ## Register the server
 
@@ -46,23 +42,12 @@ Claude Code / any `.mcp.json` client:
       "env": {
         "LIGOLO_NG_DIR": "/opt/ligolo-ng",
         "LIGOLO_API": "http://127.0.0.1:8080",
-        "LIGOLO_PROXY_CONFIG": "/home/you/.ligolo-workspace/ligolo-ng.yaml"
+        "LIGOLO_PROXY_CONFIG": "/home/you/.ligolo-workspace/ligolo-ng.yaml",
+        "LIGOLO_SCOPE": "10.10.10.0/24,172.16.5.0/24"
       }
     }
   }
 }
-```
-
-Hermes (`.hermes/config.yaml` → `mcp_servers`) is the same block in YAML:
-
-```yaml
-ligolo:
-  command: node
-  args: ['/home/you/AI/ligolo-ng-mcp/dist/index.js']
-  env:
-    LIGOLO_NG_DIR: /opt/ligolo-ng
-    LIGOLO_API: http://127.0.0.1:8080
-    LIGOLO_PROXY_CONFIG: /home/you/.ligolo-workspace/ligolo-ng.yaml
 ```
 
 Smoke-test it without a client (lists tools, call any of them):
@@ -72,10 +57,9 @@ npx @modelcontextprotocol/inspector node /home/you/AI/ligolo-ng-mcp/dist/index.j
 ```
 
 The server logs one line to stderr at startup —
-`ready — api=http://… assessment=<name>(env|marker) read_only=false tools=19 framework=/path`.
-If `assessment=<unset>(none)`,
-the read-only tools work and the three gated ones will refuse; that is the
-expected state before you activate an engagement.
+`ready — api=http://… scope=10.10.10.0/24,… read_only=false tools=19 webui=off logs=…`.
+If it says `scope=<unset: mutating tools refuse>`, the read-only tools work and
+the three gated ones will refuse until `LIGOLO_SCOPE` is set.
 
 ## Walkthrough: one pivot
 
@@ -93,7 +77,7 @@ Numbers in the examples are from a real run; yours will differ.
   "apiUrl": "http://127.0.0.1:8080",
   "binary": "/opt/ligolo-ng/linux/proxy",
   "configPath": "/home/you/.ligolo-workspace/ligolo-ng.yaml",
-  "logPath": "/home/you/.ligolo-workspace/ligolo-proxy.log",
+  "logPath": "/home/you/.ligolo-workspace/ligolo.log",
   "seeded": true,
   "fingerprint": "9F1FE20FF2CCEA6116A8542F44D64C9729F2D97AF71B15D16B7987F452D3AAD1",
   "fingerprint_error": null
@@ -119,8 +103,8 @@ set `LIGOLO_PASSWORD`) a generated credential in
 ```
 
 The port is the proxy's configured listen port (including a `port` override from
-step 1). Upload the matching agent binary to the foothold — **log the upload in
-`state/cleanup-pending.md` the moment it lands** — and run that command.
+step 1). Upload the matching agent binary to the foothold — **note the upload
+for cleanup the moment it lands** — and run that command.
 
 **3. Confirm the agent and read its network.**
 
@@ -137,7 +121,8 @@ step 1). Upload the matching agent binary to the foothold — **log the upload i
 ```
 
 This is the `ifconfig` step: `eth1` with `172.16.5.9/24` is the segment behind
-the foothold. Check it against `scope.yaml` **before** routing it.
+the foothold. Check it against what you are authorized to reach (`LIGOLO_SCOPE`)
+**before** routing it.
 
 **4. Try the pivot before approval — expect a refusal.**
 
@@ -149,12 +134,11 @@ the foothold. Check it against `scope.yaml` **before** routing it.
 ```json
 {"error": "checkpoint-denied", "tool": "ligolo_tunnel_start", "action_taken": false,
  "exit_code": 5,
- "message": "scope/checkpoint denied for 172.16.5.9 (exit 5). Record the pivot … then re-call with target + confirmed: true.\nscope_check: HOLD — …"}
+ "message": "172.16.5.9 is inside LIGOLO_SCOPE, but this is a hard checkpoint: re-call with confirmed: true after a human has approved the pivot."}
 ```
 
-Nothing reached the proxy. This is the checkpoint, not a bug: write the pivot
-(foothold, destination, mechanism, ports) into `state/decisions.md`, get human
-approval, then continue.
+Nothing reached the proxy. This is the checkpoint, not a bug: get a human to
+approve the pivot (foothold, destination, mechanism, ports), then continue.
 
 **5. Start the tunnel with the checkpoint cleared.**
 
@@ -191,7 +175,6 @@ nmap -sS -Pn -p 22,80,445 172.16.5.9
 ```
 
 SYN and connect scans both work through the TUN — there is no SOCKS `-sT` tax.
-Every newly reachable in-scope host goes into `state/hosts.md`.
 
 **7. Confirm what is routed / listening.**
 
@@ -217,7 +200,7 @@ foothold listen:
 {"scope_checked": true, "message": "listener created",
  "listener": {"ListenerID": 0, "AgentID": 1, "Network": "tcp",
               "ListenerAddr": "0.0.0.0:4444", "RedirectAddr": "127.0.0.1:4443", "Online": true},
- "cleanup": "Record in state/cleanup-pending.md: listener 0.0.0.0:4444 -> 127.0.0.1:4443 (tcp) on agent 1; revert with ligolo_listener_delete {listenerId: 0, agentId: \"1\"}."}
+ "cleanup": "Track for cleanup: listener 0.0.0.0:4444 -> 127.0.0.1:4443 (tcp) on agent 1; revert with ligolo_listener_delete {listenerId: 0, agentId: \"1\"}."}
 ```
 
 Start the operator-side catcher on `4443` first, point the second-stage payload
@@ -238,7 +221,7 @@ Services bound to the *agent's* `127.0.0.1` are reachable through the magic CIDR
 ```
 
 `target` is the foothold (that is whose loopback you are now reaching), not the
-`240.x` address — the gate needs a host that is actually in `scope.yaml`.
+`240.x` address — the gate needs a host that is actually in `LIGOLO_SCOPE`.
 
 ```bash
 curl -s http://240.0.0.1:8080/health
@@ -269,10 +252,18 @@ segment onto its own interface so per-hop routes stay distinguishable:
 {"tool": "ligolo_route_add", "arguments": {"network": "10.9.9.0/24", "interface": "ligolo2", "target": "10.9.9.9", "confirmed": true}}
 ```
 
-**Each hop is its own checkpoint and its own `decisions.md` entry, and each hop's
-relay listener is its own cleanup item.** Don't chain deeper than the objective
-needs. Relay *chains* (agent-as-relay for downstream agents, beyond this
-listener relay) are not implemented here.
+**Each hop is its own checkpoint, and each hop's relay listener is its own
+cleanup item.** Don't chain deeper than the objective needs. Relay *chains*
+(agent-as-relay for downstream agents, beyond this listener relay) are not
+implemented here.
+
+Give each agent its own interface from the start, and never start a second
+tunnel on an agent that already runs one: ligolo 0.9.x leaves the new TUN
+orphaned, and after the next stop it stays `busy` until the proxy restarts. The
+server refuses that move (`already runs a tunnel on …`); to change an agent's
+interface, `ligolo_tunnel_stop` first. Tested end to end in a Docker lab
+(operator → pivot1 → listener → pivot2 → target, with no direct path from the
+operator to either inner segment).
 
 ## Read-only mode
 
@@ -283,28 +274,22 @@ where an accidental `tunnel_start` would be a real problem.
 
 You can still pivot by hand: the endpoints in README §HTTP endpoints used do
 exactly what the hidden tools would, minus the checkpoint — which means doing it
-by hand is a deliberate act you must record yourself.
+by hand is a deliberate act, outside the gate.
 
 ## Logs and multiple instances
 
-The proxy log lands in the assessment's state tree, numbered per instance:
+The proxy log lands in the workspace, numbered per instance:
 
 ```
-assessments/<name>/state/ligolo.log      # first instance
-assessments/<name>/state/ligolo2.log     # second
-assessments/<name>/state/ligolo3.log     # third
+<workspace>/ligolo.log      # first instance
+<workspace>/ligolo2.log     # second
+<workspace>/ligolo3.log     # third
 ```
 
-It is appended across restarts, so one file carries the whole engagement's
-proxy history for that instance. `ligolo_proxy_start` returns the path it chose
-(`logPath`), and it is worth recording that in `state/decisions.md` next to the
-pivot — an assessor reading the folder later should not have to guess which log
-belongs to which segment's proxy.
-
-Without an active assessment there is no state tree, so the file falls back to
-`<workspace>/ligolo[<n>].log`. Two other streams are not proxy logs: this
-server's own diagnostics go to stderr (the MCP client captures them), and every
-tool call is appended to `<assessment>/logs/commands.log`.
+It is appended across restarts, so one file carries that instance's whole proxy
+history. `ligolo_proxy_start` returns the path it chose (`logPath`). This
+server's own diagnostics are a separate stream: they go to stderr (the MCP
+client captures them).
 
 **A second proxy** is a normal thing to need — another engagement in the same
 session, a port already taken, a segment that must not share routes. Just start
@@ -359,19 +344,19 @@ What teardown does **not** do, and you must:
 
 - delete the uploaded agent binary on the foothold (`rm`/`del` through your shell);
 - kill the agent process if it is still running (the API cannot);
-- resolve every `state/cleanup-pending.md` row for the pivot;
-- record the teardown in `state/decisions.md` and flip the hosts in
-  `state/hosts.md` to their post-pivot state;
-- stop the proxy (`ligolo_proxy_stop`, per instance) when the engagement's
-  pivoting is done, and optionally `sudo ip link del ligolo` if a stale
-  interface is left behind. The log file stays in `state/` as evidence; do not
-  delete it at teardown.
+- clean up anything else you tracked for the pivot (relay listeners on other
+  hops, uploaded files);
+- stop the proxy (`ligolo_proxy_stop`, per instance) when the pivoting is done,
+  and optionally `sudo ip link del ligolo` if a stale interface is left behind
+  (with `CAP_NET_ADMIN`, kernel TUNs outlive the proxy). Keep the log file as
+  evidence.
 
-## Running outside BITORIA
+Teardown removes IPv4 and IPv6 routes alike; it only skips the `fe80::/64`
+link-local routes ligolo adds itself on every tunnel start.
 
-The server does not require the framework, and this is a supported mode, not a
-degraded one — proxy lifecycle, agents, interfaces, routes, listeners,
-fingerprints and teardown all work. One env var carries the authorization:
+## The gate
+
+One env var carries the authorization:
 
 ```bash
 export LIGOLO_SCOPE="10.10.10.0/24,172.16.5.9"   # hosts/CIDRs you may pivot to
@@ -383,32 +368,12 @@ the target to be inside that list **and** `confirmed: true`:
 ```
 target inside LIGOLO_SCOPE, no confirmed   → checkpoint-denied, exit 5
 target outside LIGOLO_SCOPE                → checkpoint-denied, exit 3
-neither LIGOLO_SCOPE nor an assessment     → checkpoint-denied, exit 4
+LIGOLO_SCOPE not set                       → checkpoint-denied, exit 4
 ```
-
-What standalone mode does not give you: the assessment's `scope.yaml`
-enforcement beyond `LIGOLO_SCOPE`, `state/decisions.md`, the `commands.log`
-audit trail, and state-dir logs (they fall back to `<workspace>/ligolo[<n>].log`).
-If you run assessments for real, use framework mode; `LIGOLO_SCOPE` is for
-labs, CTFs, and one-off pivots.
 
 There is no way to turn the gate off. If you find yourself wanting to, the
 honest move is to write the target into `LIGOLO_SCOPE` and confirm — that
 leaves a record of what you decided was authorized.
-
-### Framework mode needs the assessment's opt-in
-
-When a BITORIA assessment is active, `scope.yaml` must say
-
-```yaml
-ligolo:
-  mcp: true
-```
-
-It is asked at assessment setup and is **off by default**, like the Burp MCP
-block. Without it the mutating tools refuse (exit 4) — the console wrapper
-(`scripts/pivoting/ligolo_console.sh`) is the path for an engagement that did not
-opt in. Read-only tools never need it.
 
 ## Reading the responses
 
@@ -427,9 +392,11 @@ Common follow-ups while running:
 
 | Response | What to do |
 |---|---|
-| `checkpoint-denied` + `exit_code: 5` | record in `decisions.md`, get approval, re-call with `confirmed: true` |
-| `checkpoint-denied` + `exit_code: 4` | activate an assessment or set `LIGOLO_ASSESSMENT` / `LIGOLO_BITORIA_ROOT` |
-| `HTTP 401 (proxy API rejects the token …)` | credentials in `.ligolo-mcp-credentials` vs `web.users`; the header is the raw JWT, never `Bearer …` |
+| `checkpoint-denied` + `exit_code: 5` | get a human to approve the pivot, re-call with `confirmed: true` |
+| `checkpoint-denied` + `exit_code: 3` | the target is outside `LIGOLO_SCOPE`; extend it deliberately or pick an authorized target |
+| `checkpoint-denied` + `exit_code: 4` | set `LIGOLO_SCOPE` |
+| `HTTP 401 (proxy API rejects the token …)` | `LIGOLO_PASSWORD` (it wins) or `.ligolo-mcp-credentials` vs `web.users` — a password changed after seeding needs `rewriteConfig: true`; the header is the raw JWT, never `Bearer …` |
+| `tun.New device or resource busy` | the proxy still holds that TUN; use a fresh interface name, or restart the proxy |
 | `agent N not connected (known ids: …)` | agent died or reconnected under a new id — re-run `ligolo_agents_list` |
 | `interface … not found` on a route | create the interface, or use `ligolo_tunnel_start`, which does it |
 
@@ -456,7 +423,7 @@ after every tunnel restart:
 |---|---|
 | `ligolo_route_add` | returns `already_present: true` when the CIDR is already routed — a retry after `ligolo_tunnel_stop`/`tunnel_start` is a success, not an error |
 | `ligolo_proxy_start {reuse: true}` | returns the running instance instead of starting `ligolo2` on the next port with a new selfcert |
-| `ligolo_tunnel_start` | safe to repeat; `interface_created` tells you whether the tun device had to be made |
+| `ligolo_tunnel_start` | repeating it on the same interface is a no-op (`already_running: true`); `interface_created` tells you whether the tun device had to be made |
 
 `ligolo_interface_create` registers the interface in the proxy's config; it does
 not prove a kernel device exists. The reply says so (`registered: true`,

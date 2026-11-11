@@ -4,7 +4,22 @@ Fork of [`schwarztim/sec-ligolo-ng-mcp`](https://github.com/schwarztim/sec-ligol
 (MIT). Versions below are this fork's; `1.0.0` is the upstream initial release it
 started from.
 
-## 1.5.1 — 2026-11-11
+## 2.0.0 — 2026-11-11
+
+### Removed (breaking)
+
+- **Framework mode is gone; `LIGOLO_SCOPE` is the only authorization.** The
+  server no longer looks for an external `scripts/common/scope_check.py`,
+  reads an assessment's `scope.yaml` / `ligolo.mcp` flag or active-assessment
+  marker, or appends to an external `commands.log`. `LIGOLO_ASSESSMENT` and
+  `LIGOLO_BITORIA_ROOT` are ignored. Migration: set `LIGOLO_SCOPE` to the
+  hosts/CIDRs you are authorized to reach; the gate (target in scope +
+  `confirmed: true`, exit 3/4/5) is unchanged.
+- Proxy logs always go to `<workspace>/ligolo[<n>].log` (previously the
+  assessment's state tree when one was active).
+- Tool texts no longer refer to `state/decisions.md`, `state/hosts.md` or
+  `state/cleanup-pending.md`; the listener `cleanup` hint reads "Track for
+  cleanup: …".
 
 ### Fixed
 
@@ -20,8 +35,10 @@ started from.
 
 ### Documentation
 
-- README rewritten around `LIGOLO_SCOPE` as the authorization: the server is
-  self-contained and needs no external framework. Stale details fixed
+- README and USAGE rewritten around `LIGOLO_SCOPE` as the authorization: the
+  server is self-contained and needs no external framework. USAGE gains the
+  double-pivot lesson from the lab (one interface per agent, never start a
+  second tunnel on a running agent). Stale details fixed
   (`ligolo-proxy.log` and the pid file no longer exist; logs are
   `<workspace>/ligolo[<n>].log`), credential precedence spelled out, including
   the `401` after changing a password on an existing config.

@@ -438,6 +438,9 @@ curl -s -H "Authorization: $TOK" http://127.0.0.1:8080/api/v1/agents
 
 Versus upstream 1.0.0:
 
+- 3.0.0: `ligolo_route_add` refuses a route whose `network` is not contained in
+  a single `LIGOLO_SCOPE` entry, or whose `target` lies outside that network
+  (exit 3). One in-scope host no longer authorizes a route of any width.
 - 2.0.0: the external-framework integration is removed; `LIGOLO_SCOPE` is the
   only authorization and the old framework variables (`LIGOLO_ASSESSMENT` and
   the framework-root path) are ignored. Logs always go to

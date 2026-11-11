@@ -4,7 +4,7 @@ Fork of [`schwarztim/sec-ligolo-ng-mcp`](https://github.com/schwarztim/sec-ligol
 (MIT). Versions below are this fork's; `1.0.0` is the upstream initial release it
 started from.
 
-## Unreleased
+## 3.0.0 — 2026-11-11
 
 ### Security (breaking)
 

@@ -425,7 +425,7 @@ const writeTools: Tool[] = [
 ];
 
 /** Single source for the version reported over MCP and in the startup banner. */
-const VERSION = "2.0.0";
+const VERSION = "3.0.0";
 
 const tools: Tool[] = cfg.readOnly ? readTools : [...readTools, ...writeTools];
 

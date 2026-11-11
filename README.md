@@ -537,9 +537,9 @@ seeding, port override), `src/ledger.ts` (what the MCP created, for `origin`).
 - It does not create the agent binary, upload it, or clean it up on the target.
 - It does not decide scope: you do, in `LIGOLO_SCOPE`, and it refuses rather
   than guesses.
-- It does not implement relay chains (multi-hop agent chaining). The supported
-  double pivot is the `listener_add` relay described in [USAGE.md](USAGE.md)
-  (§Double pivot).
+- Relay chains (multi-hop agent chaining) have no dedicated tool, but they work
+  with one `listener_add` relay per hop — see the [USAGE.md](USAGE.md) §Double
+  pivot walk-through (a hop-3 agent connects to hop-2's relay, and so on).
 - It does not drive the WebUI. With `LIGOLO_WEBUI=1` it only turns the proxy's
   own UI on for a human, and reports what was changed there as `external`.
 

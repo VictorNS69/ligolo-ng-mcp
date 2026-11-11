@@ -253,9 +253,14 @@ segment onto its own interface so per-hop routes stay distinguishable:
 ```
 
 **Each hop is its own checkpoint, and each hop's relay listener is its own
-cleanup item.** Don't chain deeper than the objective needs. Relay *chains*
-(agent-as-relay for downstream agents, beyond this listener relay) are not
-implemented here.
+cleanup item.** Don't chain deeper than the objective needs. There is no
+dedicated "chain" tool — to go deeper than one relay, repeat the same
+`ligolo_listener_add` on each intermediate agent: hop-2 gets its own relay
+listener (`0.0.0.0:11601` -> `127.0.0.1:11601`) and hop-3's agent connects to
+hop-2's address. A relay chain is just one `listener_add` per hop, and it works
+as deep as the segments route. Tested end to end in a Docker lab with three
+agents (operator -> pivot1 -> pivot2 -> pivot3, each hop a `listener_add` relay
+on the previous agent).
 
 Give each agent its own interface from the start, and never start a second
 tunnel on an agent that already runs one: ligolo 0.9.x leaves the new TUN

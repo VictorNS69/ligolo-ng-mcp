@@ -372,8 +372,10 @@ const writeTools: Tool[] = [
   {
     name: "ligolo_listener_add",
     description:
-      "Add a listener on the agent that relays back to the operator (reverse shell catch, payload serving). GATED: " +
-      "a listener is a resident artifact on a client host — track it for cleanup.",
+      "Add a listener on the agent that relays back to the operator (reverse shell catch, payload serving), or a " +
+      "relay of the proxy's own agent listener so a downstream agent chains through this one (multi-hop: " +
+      "localAddress 0.0.0.0:11601 -> remoteAddress 127.0.0.1:11601). GATED: a listener is a resident artifact on a " +
+      "client host — track it for cleanup.",
     inputSchema: {
       type: "object" as const,
       properties: {

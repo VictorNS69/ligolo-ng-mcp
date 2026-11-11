@@ -50,7 +50,7 @@ MCP client ──stdio──> ligolo-ng-mcp ──HTTP /api/v1──> ligolo pro
 Contents: [Why this fork](#why-this-fork) · [Requirements](#requirements) ·
 [Install](#install) · [Configuration](#configuration) · [Typical
 flow](#typical-flow) · [Usage](USAGE.md) · [Logs](#logs) ·
-[Multiple instances](#multiple-instances) ·
+[Multiple instances](#multiple-instances) · [Observer WebUI](#observer-webui) ·
 [The lateral-movement gate](#the-lateral-movement-gate) · [Tools](#tools) ·
 [HTTP endpoints used](#http-endpoints-used) · [Breaking
 changes](#breaking-changes) · [Troubleshooting](#troubleshooting) ·
@@ -126,6 +126,9 @@ npm run build
 | `LIGOLO_ASSESSMENT` | — | assessment name/path for the gate; when unset, the active-assessment marker is used |
 | `LIGOLO_BITORIA_ROOT` | auto-detected | framework checkout owning `scripts/common/scope_check.py` (walks up from cwd) |
 | `LIGOLO_MCP_READ_ONLY` | off | `1` registers only the 9 read-only tools |
+| `LIGOLO_WEBUI` | off | `1` also serves the proxy's WebUI on the (loopback) API listener for a **human observer** — see [Observer WebUI](#observer-webui) |
+| `LIGOLO_WEBUI_USER` | `operator` | the human's `web.users` entry; must differ from `LIGOLO_USER` |
+| `LIGOLO_WEBUI_PASSWORD` | — | the human's password; **required** with `LIGOLO_WEBUI=1`, never generated, never returned |
 | `LIGOLO_SCOPE` | — | **standalone authorization**: comma-separated hosts/CIDRs this server may pivot to when no BITORIA assessment is in play (see [Running outside BITORIA](#running-outside-bitoria)) |
 | `LIGOLO_ASSESSMENT` (effect) | — | when set/resolved, proxy logs go to `assessments/<name>/state/ligolo[<n>].log`; otherwise `<workspace>/ligolo[<n>].log` |
 
@@ -165,8 +168,9 @@ request/response payloads, plus reverse shells, agent-localhost, double pivot,
 read-only mode and teardown discipline.
 
 1. `ligolo_proxy_start` (optionally `{ "port": "443", "rewriteConfig": true }`)
-   → returns `{ running, pid, apiUrl, fingerprint }`. The config is seeded
-   headless: `web.enabled: true`, `web.enableui: false`, loopback API.
+   → returns `{ running, pid, apiUrl, fingerprint, webui }`. The config is seeded
+   headless: `web.enabled: true`, `web.enableui: false` (unless
+   `LIGOLO_WEBUI=1`), loopback API.
 2. `ligolo_certificate_fingerprint` → `[0-9A-F]{64}`. This is the value the
    agent pins; no console round-trip.
 3. `ligolo_agent_command` `{ "proxyIp": "<operator-ip>" }` → fingerprint-pinned
@@ -245,6 +249,83 @@ URL and log path. Stopping is per instance (`ligolo_proxy_stop {"instance":
 status. If a proxy was started outside this server (by hand or by the console
 wrapper), status reports it as `managed: false` and the log path stays wherever
 that process put it.
+
+## Observer WebUI
+
+The intended split: **autonomous agents drive the pivot through this MCP; a
+human watches it in the browser.** ligolo-ng (0.8+) serves its WebUI on the same
+listener as the REST API, so turning it on costs no extra port:
+
+```json
+"env": {
+  "LIGOLO_WEBUI": "1",
+  "LIGOLO_WEBUI_PASSWORD": "<the human's password>"
+}
+```
+
+`ligolo_proxy_start` then seeds `web.enableui: true`, sets `corsallowedorigin` to
+the listener, and adds a second `web.users` entry (`operator` by default) next to
+the MCP's own. It answers with:
+
+```json
+"webui": {
+  "enabled": true,
+  "url": "http://127.0.0.1:8080/",
+  "login": { "api_url": "http://127.0.0.1:8080", "user": "operator" },
+  "note": "Observer UI for a human operator. It is NOT read-only: …"
+}
+```
+
+Open the URL, enter that API URL, the user and your password. The UI polls the
+proxy every 2 s, so agents, tunnels, routes and listeners the MCP creates appear
+live. From another machine use `ssh -L 8080:127.0.0.1:8080 <operator-host>`;
+each instance (`ligolo2`, …) has its own UI on its own API port.
+
+What the server enforces, and why:
+
+| Rule | Reason |
+|---|---|
+| Off by default | the UI is a second control path |
+| Loopback listener only (`127.0.0.0/8`, `::1`, `localhost`) | the upstream API is experimental and unhardened |
+| `LIGOLO_WEBUI_PASSWORD` required, never generated | every channel this server could hand a generated password over (tool output, the creds file, stderr) is one the agent reads |
+| Separate user from `LIGOLO_USER` | the agent's credential is never given to the human; revoke either independently |
+| Human password never in tool output or `.ligolo-mcp-credentials` | tool output is the agent's context. It is in `ligolo-ng.yaml` only until the proxy's first load re-hashes it to argon2id |
+| Existing config with the UI off is not silently changed | `rewriteConfig: true` (backup to `.bak`) or edit it yourself |
+
+### Changes made in the UI
+
+**The WebUI is not read-only.** ligolo has no read-only role, so a route, tunnel
+or listener created there **bypasses the lateral checkpoint and the audit log**.
+That is acceptable for an authorized human operator — the gate exists to bound
+the agents — but the agents must not be confused by it. The server therefore
+keeps a ledger of what it created (`<workspace>/.ligolo-mcp-ledger.json`, reset
+when a config is freshly seeded) and labels everything it reads:
+
+- `ligolo_route_list`, `ligolo_interface_list`, `ligolo_listener_list`: every
+  entry has `origin: "mcp" | "external"` (`"proxy"` for ligolo's own IPv6
+  link-local routes); `removed_outside_mcp` lists MCP-made resources that are
+  gone.
+- `ligolo_agents_list`: `tunnel_origin` per running tunnel, and
+  `tunnels_stopped_outside_mcp` for an MCP tunnel stopped while its agent stayed
+  connected (a disconnected agent is not reported).
+- `ligolo_proxy_status`: `outside_mcp` with the full `external` /
+  `removed_outside_mcp` picture per instance.
+
+`external` means *not created through this MCP* — the WebUI, the console, or
+state the proxy restored from an existing config. ligolo does not record which
+user made a change, so this is attribution by elimination, not an audit trail.
+A removed entry keeps being reported until the MCP deletes or recreates it;
+`ligolo_route_delete` and `ligolo_listener_delete` are idempotent, so they clear
+it.
+
+### The limit: agents with a shell
+
+If the autonomous agent has a **shell on the operator host as the same OS user**
+that runs the proxy, the gate is a convention, not a control — with or without
+the WebUI. It can read `.ligolo-mcp-credentials` (or the MCP's own config) and
+call the API directly. For a guarantee, run the proxy and this server as a
+dedicated OS user, and give the agent only the MCP connection, not read access to
+the workspace or the MCP client's config.
 
 ## The lateral-movement gate
 
@@ -447,7 +528,7 @@ Logs: `<config dir>/ligolo-proxy.log` (proxy stdout/stderr) and
 ```bash
 npm run build     # tsc -> dist/
 npm run dev       # tsc --watch
-npm test          # build, then 22 tests over real MCP stdio against a stub API
+npm test          # build, then 51 tests over real MCP stdio against a stub API
 ```
 
 The suite needs no ligolo binary, no root and no network: it spawns
@@ -466,6 +547,9 @@ client, checkpoint gate, fingerprint, assessment resolution),
   (`LIGOLO_API_LISTEN=127.0.0.1:8080`, the default), and keep `web.secret` /
   `web.users` in the proxy config rather than shell history. The upstream WebUI
   warns the API is experimental and wants a reverse proxy if ever exposed.
+- `LIGOLO_WEBUI=1` is refused on a non-loopback listener. The UI can change
+  proxy state outside the gate; see [Observer WebUI](#observer-webui), including
+  the same-OS-user limit that applies whether or not it is on.
 - `LIGOLO_PROXY_ADDR` defaults to `0.0.0.0:11601` — the agent-facing listener.
   Narrow it to the operator address the foothold can actually reach when the
   host is multi-homed.
@@ -484,7 +568,8 @@ client, checkpoint gate, fingerprint, assessment resolution),
   guesses.
 - It does not implement relay chains (multi-hop agent chaining). The supported
   double pivot is the `listener_add` relay described in the framework doctrine.
-- It does not talk to the WebUI.
+- It does not drive the WebUI. With `LIGOLO_WEBUI=1` it only turns the proxy's
+  own UI on for a human, and reports what was changed there as `external`.
 
 ## License
 

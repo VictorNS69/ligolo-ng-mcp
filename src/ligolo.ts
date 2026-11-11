@@ -63,6 +63,16 @@ export interface Config {
    * which makes mutating tools refuse — the server still works read-only.
    */
   standaloneScope: string[];
+  /**
+   * Observer WebUI (`LIGOLO_WEBUI=1`): the proxy also serves its browser UI on
+   * the API listener, for a *human* to watch what the agents do. Off by default.
+   * The human gets their own `web.users` entry so the agent's credential is
+   * never handed out, and the human's password is never written anywhere this
+   * server reads back or returns.
+   */
+  webUi: boolean;
+  webUiUser: string;
+  webUiPassword: string;
 }
 
 function envStr(env: NodeJS.ProcessEnv, key: string, fallback: string): string {
@@ -194,7 +204,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, cwd: string = p
       .split(",")
       .map((v) => v.trim())
       .filter((v) => v !== ""),
+    webUi: /^(1|true|yes|on)$/i.test(envStr(env, "LIGOLO_WEBUI", "")),
+    webUiUser: envStr(env, "LIGOLO_WEBUI_USER", "operator"),
+    webUiPassword: envStr(env, "LIGOLO_WEBUI_PASSWORD", ""),
   };
+}
+
+/** Host part of a `host:port` listen address, brackets stripped. */
+export function listenHost(addr: string): string {
+  const bare = addr.replace(/^https?:\/\//, "");
+  const host = bare.includes(":") ? bare.slice(0, bare.lastIndexOf(":")) : bare;
+  return host.replace(/^\[|\]$/g, "");
+}
+
+/** True for 127.0.0.0/8, ::1 and localhost — the only places the WebUI may listen. */
+export function isLoopback(host: string): boolean {
+  const h = host.toLowerCase();
+  return h === "localhost" || h === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
 }
 
 /** A gate refusal is a first-class outcome, not a generic failure. */

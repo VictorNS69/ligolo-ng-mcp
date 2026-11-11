@@ -35,6 +35,7 @@ import {
   AgentRecord,
   ListenerRecord,
 } from "./ligolo.js";
+import { computeDrift, keys, Kind, Ledger, liveResources } from "./ledger.js";
 import { configForInstance, instanceStatus, listInstances, startProxy, stopProxy } from "./proxy.js";
 
 const cfg: Config = loadConfig();
@@ -84,6 +85,50 @@ function log(summary: string): void {
   logCommand(cfg, summary);
 }
 
+/**
+ * Record what an MCP mutation made (or removed) in the instance's ledger.
+ *
+ * Runs only after the API call succeeded, and never fails the tool: the pivot
+ * already happened, and reporting it as an error would invite a retry that
+ * duplicates it. The worst case of a lost write is a resource later shown as
+ * origin "external" — visible, not silent.
+ */
+function track(c: Config, fn: (ledger: Ledger) => void): void {
+  try {
+    fn(Ledger.load(c.proxyConfig));
+  } catch (err) {
+    console.error(`ligolo-ng-mcp: ledger update failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** Ledger entries of one kind that are no longer live (removed in the WebUI/console, or by a restart). */
+function removedOutside(ledger: Ledger, kind: Kind, liveKeys: Iterable<string>): Payload[] {
+  const live = new Set(liveKeys);
+  return ledger
+    .entries()
+    .filter((e) => e.kind === kind && !live.has(e.key))
+    .map((e) => ({ kind: e.kind, key: e.key, created_at: e.createdAt }));
+}
+
+/** Everything on this proxy the MCP did not make, and everything it made that is gone. */
+async function outsideMcp(c: Config, api: LigoloApi): Promise<Payload> {
+  try {
+    const [interfaces, agents, listeners] = await Promise.all([api.interfaces(), api.agents(), api.listeners()]);
+    const drift = computeDrift(Ledger.load(c.proxyConfig), liveResources(interfaces, agents, listeners), agents);
+    return {
+      changed: drift.external.length + drift.removed_outside_mcp.length > 0,
+      external: drift.external.map((r) => ({ kind: r.kind, ...r.detail })),
+      removed_outside_mcp: drift.removed_outside_mcp.map((e) => ({ kind: e.kind, key: e.key, created_at: e.createdAt })),
+      meaning:
+        "external = live on the proxy but not created through this MCP (WebUI, console, or restored from an " +
+        "existing config). removed_outside_mcp = created through this MCP, no longer present. ligolo does not " +
+        "record who made a change; treat external state as the operator's, and do not delete it unasked.",
+    };
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 const TARGET = {
   type: "string",
   description:
@@ -115,7 +160,9 @@ const readTools: Tool[] = [
   {
     name: "ligolo_proxy_status",
     description:
-      "Check the ligolo proxy: API liveness (GET /api/v1/ping), pid, binary, config and log paths. Read-only.",
+      "Check the ligolo proxy: API liveness (GET /api/v1/ping), pid, binary, config and log paths, whether the " +
+      "observer WebUI is on (webui), and `outside_mcp`: proxy state not created through this server (WebUI or " +
+      "console changes) plus MCP-made state that has disappeared. Read-only.",
     inputSchema: { type: "object" as const, properties: { instance: INSTANCE }, required: [] },
     annotations: { readOnlyHint: true },
   },
@@ -123,7 +170,7 @@ const readTools: Tool[] = [
     name: "ligolo_agents_list",
     description:
       "List connected agents: name, session id, remote address, tunnel state and the full agent-side interface list " +
-      "with addresses (this replaces the console's `ifconfig`). Read-only.",
+      "with addresses (this replaces the console's `ifconfig`), and tunnel_origin for running tunnels. Read-only.",
     inputSchema: { type: "object" as const, properties: { instance: INSTANCE }, required: [] },
     annotations: { readOnlyHint: true },
   },
@@ -154,19 +201,19 @@ const readTools: Tool[] = [
   },
   {
     name: "ligolo_interface_list",
-    description: "Configured TUN interfaces with their routed destinations and active state. Read-only.",
+    description: "Configured TUN interfaces with their routed destinations and active state. Each entry carries origin: \"mcp\" (made by this server) or \"external\" (WebUI, console, restored config). Read-only.",
     inputSchema: { type: "object" as const, properties: { instance: INSTANCE }, required: [] },
     annotations: { readOnlyHint: true },
   },
   {
     name: "ligolo_route_list",
-    description: "Routes per interface, flattened, with active state. Read-only.",
+    description: "Routes per interface, flattened, with active state. Each entry carries origin: \"mcp\" (made by this server) or \"external\" (WebUI, console, restored config). Read-only.",
     inputSchema: { type: "object" as const, properties: { instance: INSTANCE }, required: [] },
     annotations: { readOnlyHint: true },
   },
   {
     name: "ligolo_listener_list",
-    description: "Active listeners/redirectors across agents (agent, listen addr, redirect addr, network, online). Read-only.",
+    description: "Active listeners/redirectors across agents (agent, listen addr, redirect addr, network, online). Each entry carries origin: \"mcp\" (made by this server) or \"external\" (WebUI, console, restored config). Read-only.",
     inputSchema: { type: "object" as const, properties: { instance: INSTANCE }, required: [] },
     annotations: { readOnlyHint: true },
   },
@@ -209,7 +256,9 @@ const writeTools: Tool[] = [
     name: "ligolo_proxy_start",
     description:
       "Start the proxy locally (headless, -selfcert, API enabled) with a config seeded for loopback API use, then " +
-      "wait for /api/v1/ping. Existing config is only rewritten with rewriteConfig: true (original kept as .bak).",
+      "wait for /api/v1/ping. Existing config is only rewritten with rewriteConfig: true (original kept as .bak). " +
+      "With LIGOLO_WEBUI=1 the proxy also serves its WebUI on the same loopback listener for a human observer " +
+      "(webui.url); that login is the human's, never this server's.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -341,7 +390,9 @@ const writeTools: Tool[] = [
   },
   {
     name: "ligolo_listener_delete",
-    description: "Delete a listener by id on an agent (cleanup). Logged, not checkpointed.",
+    description:
+      "Delete a listener by id on an agent (cleanup). Logged, not checkpointed. A listener that is already gone " +
+      "(e.g. removed in the WebUI) is reported as already_absent, not as an error.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -373,7 +424,7 @@ const writeTools: Tool[] = [
 ];
 
 /** Single source for the version reported over MCP and in the startup banner. */
-const VERSION = "1.4.0";
+const VERSION = "1.5.0";
 
 const tools: Tool[] = cfg.readOnly ? readTools : [...readTools, ...writeTools];
 
@@ -498,12 +549,21 @@ async function handleProxyStart(args: Args): Promise<Payload> {
 }
 
 async function handleAgents(args: Args): Promise<Payload> {
-  const { api, instance } = ctx(args);
+  const { c, api, instance } = ctx(args);
   const agents = await api.agents();
+  const ledger = Ledger.load(c.proxyConfig);
+  const running = Object.values(agents ?? {}).filter((a) => a.Running);
+  // A tunnel the MCP started whose agent is still connected but no longer
+  // running was stopped elsewhere; a disconnected agent is not reported.
+  const connected = Object.values(agents ?? {}).map((a) => a.SessionID);
+  const stopped = removedOutside(ledger, "tunnel", running.map((a) => a.SessionID)).filter((e) =>
+    connected.includes(String(e.key)),
+  );
   return {
     scope_checked: false,
     instance,
     count: Object.keys(agents ?? {}).length,
+    ...(stopped.length > 0 ? { tunnels_stopped_outside_mcp: stopped } : {}),
     agents: Object.entries(agents ?? {}).map(([id, a]) => ({
       agent_id: id,
       name: a.Name,
@@ -511,6 +571,7 @@ async function handleAgents(args: Args): Promise<Payload> {
       remote_addr: a.RemoteAddr,
       tunnel_interface: a.Interface,
       tunnel_running: a.Running,
+      tunnel_origin: a.Running ? ledger.origin("tunnel", keys.tunnel(a.SessionID)) : null,
       interfaces: (a.Network ?? []).map((n) => ({ name: n.Name, mtu: n.MTU, addresses: n.Addresses ?? [] })),
     })),
   };
@@ -557,6 +618,10 @@ async function handleTunnelStart(args: Args): Promise<Payload> {
     interfaceCreated = true;
   }
   const started = await api.startTunnel(agentId, tun);
+  track(c, (l) => {
+    if (interfaceCreated) l.record("interface", keys.interface(tun));
+    l.record("tunnel", keys.tunnel(agent.SessionID));
+  });
   return {
     scope_checked: true,
     instance,
@@ -608,12 +673,14 @@ async function handleRouteAdd(args: Args): Promise<Payload> {
         network,
         interface: iface,
         already_present: true,
+        origin: Ledger.load(c.proxyConfig).origin("route", keys.route(iface, network)),
         message: `route ${network} already present on ${iface}`,
         note: "No change made; the segment is already routed through this interface.",
       };
     }
     throw err;
   }
+  track(c, (l) => l.record("route", keys.route(iface, network)));
   return {
     scope_checked: true,
     instance,
@@ -625,7 +692,7 @@ async function handleRouteAdd(args: Args): Promise<Payload> {
 }
 
 async function handleListenerAdd(args: Args): Promise<Payload> {
-  const { api, instance } = ctx(args);
+  const { c, api, instance } = ctx(args);
   const local = str(args, "localAddress");
   const remote = str(args, "remoteAddress");
   const agentId = str(args, "agentId");
@@ -660,6 +727,10 @@ async function handleListenerAdd(args: Args): Promise<Payload> {
   const created = await api.createListener(agentId, local, remote, network);
   const listeners = (await api.listeners()) ?? [];
   const mine = listeners.filter((l: ListenerRecord) => String(l.AgentID) === agentId && l.ListenerAddr === local);
+  if (mine[0] !== undefined) {
+    const made = mine[0];
+    track(c, (l) => l.record("listener", keys.listener(made), { listenerId: made.ListenerID, agentId: made.AgentID }));
+  }
   return {
     scope_checked: true,
     instance,
@@ -688,9 +759,14 @@ async function handleTeardown(args: Args): Promise<Payload> {
       steps.push({ step: label, ok: false, error: err instanceof Error ? err.message : String(err) });
     }
   };
+  const agentsBefore = await api.agents().catch(() => null);
   const listeners = (await api.listeners().catch(() => [])) ?? [];
   for (const listener of listeners.filter((l) => String(l.AgentID) === agentId)) {
-    await attempt(`delete listener ${listener.ListenerID}`, () => api.deleteListener(agentId, listener.ListenerID));
+    await attempt(`delete listener ${listener.ListenerID}`, async () => {
+      const done = await api.deleteListener(agentId, listener.ListenerID);
+      track(c, (l) => l.forget("listener", keys.listener(listener)));
+      return done;
+    });
   }
   // Routes are deleted while the TUN still exists: stopping the tunnel tears
   // the interface down underneath us and the proxy then answers 500
@@ -700,17 +776,31 @@ async function handleTeardown(args: Args): Promise<Payload> {
   const record = (interfaces ?? {})[iface] as { Routes?: { Destination: string }[] } | undefined;
   const routes = (record?.Routes ?? []).filter((r) => !r.Destination.includes(":"));
   for (const route of routes) {
-    await attempt(`delete route ${route.Destination}`, () =>
-      api.deleteRoute(iface, route.Destination).catch((err: unknown) => {
+    await attempt(`delete route ${route.Destination}`, async () => {
+      const done = await api.deleteRoute(iface, route.Destination).catch((err: unknown) => {
         const message = err instanceof Error ? err.message : String(err);
         if (/no such process|does not exist|not found/i.test(message)) return { message: "already gone" };
         throw err;
-      }),
-    );
+      });
+      track(c, (l) => l.forget("route", keys.route(iface, route.Destination)));
+      return done;
+    });
   }
-  await attempt("stop tunnel", () => api.stopTunnel(agentId));
+  await attempt("stop tunnel", async () => {
+    const done = await api.stopTunnel(agentId);
+    const session = agentsBefore?.[agentId]?.SessionID;
+    if (session !== undefined) track(c, (l) => l.forget("tunnel", keys.tunnel(session)));
+    return done;
+  });
   if (deleteInterface) {
-    await attempt(`delete interface ${iface}`, () => api.deleteInterface(iface));
+    await attempt(`delete interface ${iface}`, async () => {
+      const done = await api.deleteInterface(iface);
+      track(c, (l) => {
+        l.forget("interface", keys.interface(iface));
+        l.forgetWhere((e) => e.kind === "route" && e.key.startsWith(`${iface} `));
+      });
+      return done;
+    });
   }
   return {
     scope_checked: false,
@@ -738,16 +828,21 @@ async function handleToolCall(name: string, args: Args): Promise<Payload> {
       const wanted = str(args, "instance");
       const compatibility =
         "requires ligolo-ng proxy 0.9.x (tested 0.9.1, 0.9.2); the proxy API is experimental upstream";
+      const withDrift = async (state: Awaited<ReturnType<typeof instanceStatus>>): Promise<Payload> => {
+        if (!state.running) return state as unknown as Payload;
+        const c = state.managed === true ? configForInstance(cfg, state.instance) : cfg;
+        return { ...state, outside_mcp: await outsideMcp(c, new LigoloApi(c)) };
+      };
       if (wanted !== "") {
-        return { ...(await instanceStatus(cfg, wanted)), scope_checked: false, compatibility };
+        return { ...(await withDrift(await instanceStatus(cfg, wanted))), scope_checked: false, compatibility };
       }
       const { entries, logDir } = listInstances(cfg);
       if (entries.length === 0) {
-        return { ...(await instanceStatus(cfg)), scope_checked: false, compatibility, instances: [] };
+        return { ...(await withDrift(await instanceStatus(cfg))), scope_checked: false, compatibility, instances: [] };
       }
-      const states = await Promise.all(entries.map((e) => instanceStatus(cfg, e.name)));
+      const states = await Promise.all(entries.map(async (e) => withDrift(await instanceStatus(cfg, e.name))));
       return {
-        running: states.some((s) => s.running),
+        running: states.some((s) => s.running === true),
         count: states.length,
         instances: states,
         log_dir: logDir,
@@ -776,6 +871,7 @@ async function handleToolCall(name: string, args: Args): Promise<Payload> {
       const iface = str(args, "name", c.interfaceName);
       log(`ligolo_interface_create instance=${instance} ${iface}`);
       const created = await api.createInterface(iface);
+      track(c, (l) => l.record("interface", keys.interface(iface)));
       return {
         scope_checked: false,
         instance,
@@ -796,25 +892,34 @@ async function handleToolCall(name: string, args: Args): Promise<Payload> {
       };
     }
     case "ligolo_interface_list": {
-      const { api, instance } = ctx(args);
+      const { c, api, instance } = ctx(args);
       const interfaces = await api.interfaces();
+      const ledger = Ledger.load(c.proxyConfig);
+      const removed = removedOutside(ledger, "interface", Object.keys(interfaces ?? {}));
       return {
         scope_checked: false,
         instance,
+        ...(removed.length > 0 ? { removed_outside_mcp: removed } : {}),
         interfaces: Object.entries(interfaces ?? {}).map(([name, rec]) => ({
           name,
           active: rec.Active,
-          routes: rec.Routes ?? [],
+          origin: ledger.origin("interface", keys.interface(name)),
+          routes: (rec.Routes ?? []).map((r) => ({
+            ...r,
+            origin: /^fe80:/i.test(r.Destination) ? "proxy" : ledger.origin("route", keys.route(name, r.Destination)),
+          })),
         })),
       };
     }
     case "ligolo_tunnel_start":
       return handleTunnelStart(args);
     case "ligolo_tunnel_stop": {
-      const { api, instance } = ctx(args);
+      const { c, api, instance } = ctx(args);
       const agentId = str(args, "agentId");
       log(`ligolo_tunnel_stop instance=${instance} agent=${agentId}`);
+      const session = (await api.agents().catch(() => null))?.[agentId]?.SessionID;
       const stopped = await api.stopTunnel(agentId);
+      if (session !== undefined) track(c, (l) => l.forget("tunnel", keys.tunnel(session)));
       return { scope_checked: false, instance, agent_id: agentId, message: stopped.message };
     }
     case "ligolo_route_add":
@@ -825,31 +930,81 @@ async function handleToolCall(name: string, args: Args): Promise<Payload> {
       const iface = str(args, "interface", c.interfaceName);
       log(`ligolo_route_delete instance=${instance} ${network} dev ${iface}`);
       const removed = await api.deleteRoute(iface, network);
+      track(c, (l) => l.forget("route", keys.route(iface, network)));
       return { scope_checked: false, instance, network, interface: iface, message: removed.message };
     }
     case "ligolo_route_list": {
-      const { api, instance } = ctx(args);
+      const { c, api, instance } = ctx(args);
       const interfaces = await api.interfaces();
+      const ledger = Ledger.load(c.proxyConfig);
       const routes = Object.entries(interfaces ?? {}).flatMap(([name, rec]) =>
-        (rec.Routes ?? []).map((r) => ({ interface: name, destination: r.Destination, active: r.Active })),
+        (rec.Routes ?? []).map((r) => ({
+          interface: name,
+          destination: r.Destination,
+          active: r.Active,
+          origin: /^fe80:/i.test(r.Destination) ? "proxy" : ledger.origin("route", keys.route(name, r.Destination)),
+        })),
       );
-      return { scope_checked: false, instance, count: routes.length, routes };
+      const removed = removedOutside(
+        ledger,
+        "route",
+        routes.map((r) => keys.route(r.interface, r.destination)),
+      );
+      return {
+        scope_checked: false,
+        instance,
+        count: routes.length,
+        routes,
+        ...(removed.length > 0 ? { removed_outside_mcp: removed } : {}),
+      };
     }
     case "ligolo_listener_add":
       return handleListenerAdd(args);
     case "ligolo_listener_list": {
-      const { api, instance } = ctx(args);
+      const { c, api, instance } = ctx(args);
       const listeners = (await api.listeners()) ?? [];
-      return { scope_checked: false, instance, count: listeners.length, listeners };
+      const ledger = Ledger.load(c.proxyConfig);
+      const removed = removedOutside(ledger, "listener", listeners.map((l) => keys.listener(l)));
+      return {
+        scope_checked: false,
+        instance,
+        count: listeners.length,
+        listeners: listeners.map((l) => ({ ...l, origin: ledger.origin("listener", keys.listener(l)) })),
+        ...(removed.length > 0 ? { removed_outside_mcp: removed } : {}),
+      };
     }
     case "ligolo_listener_delete": {
-      const { api, instance } = ctx(args);
+      const { c, api, instance } = ctx(args);
       const listenerId = num(args, "listenerId");
       const agentId = str(args, "agentId");
       if (listenerId === null) throw new Error("listenerId is required (from ligolo_listener_list)");
       if (agentId === "") throw new Error("agentId is required — listeners are addressed per agent");
       log(`ligolo_listener_delete instance=${instance} agent=${agentId} listener=${listenerId}`);
-      const deleted = await api.deleteListener(agentId, listenerId);
+      const forgetIt = (): void =>
+        track(c, (l) =>
+          l.forgetWhere((e) => e.kind === "listener" && e.listenerId === listenerId && e.agentId === Number(agentId)),
+        );
+      let deleted: { message: string };
+      try {
+        deleted = await api.deleteListener(agentId, listenerId);
+      } catch (err) {
+        // Already removed (typically from the WebUI): the desired end state, so
+        // cleanup stays idempotent — the same rule deleteRoute follows.
+        const still = ((await api.listeners().catch(() => null)) ?? null)?.some(
+          (l) => l.ListenerID === listenerId && String(l.AgentID) === agentId,
+        );
+        if (still !== false) throw err;
+        forgetIt();
+        return {
+          scope_checked: false,
+          instance,
+          agent_id: agentId,
+          listener_id: listenerId,
+          already_absent: true,
+          message: `listener ${listenerId} on agent ${agentId} was already absent — nothing to remove.`,
+        };
+      }
+      forgetIt();
       return { scope_checked: false, instance, agent_id: agentId, listener_id: listenerId, message: deleted.message };
     }
     case "ligolo_certificate_fingerprint": {
@@ -939,6 +1094,7 @@ async function main(): Promise<void> {
     `ligolo-ng-mcp ${VERSION} ready — api=${cfg.apiUrl} ` +
       `assessment=${cfg.assessment || "<unset>"}(${cfg.assessmentSource}) ` +
       `read_only=${cfg.readOnly} tools=${tools.length} framework=${cfg.bitoriaRoot ?? "<not found>"} ` +
+      `webui=${cfg.webUi ? `on(user=${cfg.webUiUser})` : "off"} ` +
       `logs=${cfg.assessment === "" ? "<workspace>/ligolo[<n>].log" : `assessments/${cfg.assessment}/state/ligolo[<n>].log`}`,
   );
 }

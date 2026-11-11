@@ -4,6 +4,32 @@ Fork of [`schwarztim/sec-ligolo-ng-mcp`](https://github.com/schwarztim/sec-ligol
 (MIT). Versions below are this fork's; `1.0.0` is the upstream initial release it
 started from.
 
+## 1.5.0 — 2026-11-11
+
+### Added
+
+- **Observer WebUI (`LIGOLO_WEBUI=1`).** Agents drive the pivot through the MCP;
+  a human watches it live in ligolo's own WebUI, served on the same loopback API
+  listener. Seeds `web.enableui: true`, `corsallowedorigin` and a separate
+  `web.users` entry (`LIGOLO_WEBUI_USER`, default `operator`). `ligolo_proxy_start`
+  and `ligolo_proxy_status` return `webui: {enabled, url, login, note}`.
+  Refused, before anything is written, on a non-loopback listener, without
+  `LIGOLO_WEBUI_PASSWORD`, or when the human user equals `LIGOLO_USER`. The
+  human password is never generated, returned, or written to
+  `.ligolo-mcp-credentials`. Verified live against proxy 0.9.1.
+- **Origin of proxy state.** A per-instance ledger
+  (`.ligolo-mcp-ledger.json`) records what this server created. Route,
+  interface and listener lists carry `origin: "mcp" | "external"`;
+  `ligolo_agents_list` carries `tunnel_origin`; `ligolo_proxy_status` reports
+  `outside_mcp` (external state, and MCP-made state removed elsewhere).
+
+### Changed
+
+- `ligolo_listener_delete` on a listener that is already gone returns
+  `already_absent: true` instead of an error, matching `ligolo_route_delete`.
+- An existing config with the UI off is refused under `LIGOLO_WEBUI=1` until
+  `rewriteConfig: true` (backup kept) or a manual edit.
+
 ## 1.4.0 — 2026-11-08
 
 Field report from a five-host, four-hop pivot driven entirely through this

@@ -270,6 +270,12 @@ const writeTools: Tool[] = [
             "Use it when the default 11601 is already taken or an egress rule pins a port.",
           default: "11601",
         },
+        apiPort: {
+          type: "string",
+          description:
+            "API (and WebUI) listen port for this instance, overriding LIGOLO_API_LISTEN's port (1-65535). The " +
+            "host stays the configured one, loopback by default.",
+        },
         rewriteConfig: {
           type: "boolean",
           description: "Rewrite an existing ligolo-ng.yaml that lacks web.enabled/web.users (backup written first)",
@@ -813,7 +819,18 @@ async function handleTeardown(args: Args): Promise<Payload> {
   };
 }
 
+const REGISTERED: ReadonlySet<string> = new Set(tools.map((t) => t.name));
+
 async function handleToolCall(name: string, args: Args): Promise<Payload> {
+  // Read-only mode used to only *hide* the mutating tools from tools/list: a
+  // client calling one by name still reached the gate and the proxy API. Only
+  // a registered tool may run.
+  if (!REGISTERED.has(name)) {
+    if (cfg.readOnly && writeTools.some((t) => t.name === name)) {
+      throw new Error(`${name} is not available: this server runs read-only (LIGOLO_MCP_READ_ONLY). Nothing was sent.`);
+    }
+    throw new Error(`unknown tool: ${name}`);
+  }
   rejectUnknownArgs(name, args);
   switch (name) {
     case "ligolo_proxy_start":

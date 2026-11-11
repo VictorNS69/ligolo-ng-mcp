@@ -203,10 +203,29 @@ function writeManifest(cfg: Config, entries: Record<string, InstanceEntry>): voi
   writeFileSync(file, `${JSON.stringify(entries, null, 2)}\n`, { mode: 0o600 });
 }
 
-/** Instances whose pid is still alive; entries for dead processes are dropped. */
+/**
+ * Is `entry.pid` still *that* proxy? A pid is reused once its process exits, so
+ * "alive" alone let a stale manifest entry point at an unrelated process — and
+ * ligolo_proxy_stop would SIGTERM it. On Linux the spawned proxy's argv carries
+ * `-config <configPath>`, which identifies it; elsewhere fall back to liveness.
+ */
+function isOurProxy(entry: InstanceEntry): boolean {
+  if (!Number.isInteger(entry.pid) || !alive(entry.pid)) return false;
+  const proc = `/proc/${entry.pid}/cmdline`;
+  if (!existsSync("/proc/self/cmdline")) return true;
+  try {
+    const argv = readFileSync(proc, "utf8").split("\0");
+    const at = argv.indexOf("-config");
+    return at !== -1 && argv[at + 1] === entry.configPath;
+  } catch {
+    return false;
+  }
+}
+
+/** Instances whose proxy is still running; entries for dead (or pid-reused) processes are dropped. */
 export function liveInstances(cfg: Config): InstanceEntry[] {
   const all = readManifest(cfg);
-  const live = Object.values(all).filter((e) => Number.isInteger(e.pid) && alive(e.pid));
+  const live = Object.values(all).filter(isOurProxy);
   if (live.length !== Object.keys(all).length) {
     writeManifest(cfg, Object.fromEntries(live.map((e) => [e.name, e])));
   }
@@ -516,13 +535,34 @@ export async function startProxy(
   const scoped = { ...cfg, apiUrl: spec.apiUrl, password: seeded.password };
   const api = new LigoloApi(scoped);
 
-  // Already answering on this instance's API: nothing to spawn.
+  // Something already answers on this instance's API port. Spawning anyway
+  // used to start a second proxy that could not bind, while the ping loop below
+  // got its "pong" from the *other* process and recorded the doomed child's pid
+  // as a managed instance.
   try {
     await api.ping();
     const existing = liveInstances(cfg).find((e) => e.index === spec.index);
     if (existing) return { ...stateOf(scoped, spec, existing), seeded: false };
-  } catch {
-    /* not up — start it */
+    return {
+      ...stateOf(scoped, spec, null),
+      running: true,
+      pid: null,
+      managed: false,
+      seeded: Boolean(seeded.created),
+      note:
+        `a proxy not started by this server already answers ${spec.apiUrl}; nothing was spawned. ` +
+        "Use it as is, stop it where it was started, or pass apiPort/instance for a separate one.",
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/HTTP \d{3}/.test(message)) {
+      throw new Error(
+        `${spec.apiUrl} is already served by something that rejects this server's API call (${message}). ` +
+          "It is either a proxy with other credentials or another service; nothing was spawned. Free the port, " +
+          "or pass apiPort for a different one.",
+      );
+    }
+    /* nothing listening — start it */
   }
 
   mkdirSync(dirname(spec.logPath), { recursive: true });

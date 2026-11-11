@@ -23,6 +23,31 @@ started from.
   `ligolo_agents_list` carries `tunnel_origin`; `ligolo_proxy_status` reports
   `outside_mcp` (external state, and MCP-made state removed elsewhere).
 
+### Fixed
+
+- **Read-only mode only hid the mutating tools.** With `LIGOLO_MCP_READ_ONLY=1`
+  they were missing from `tools/list`, but a client calling `ligolo_route_add`
+  by name still ran the gate and reached the proxy API. Dispatch now accepts
+  only registered tools and answers `not available: this server runs read-only`.
+- **`apiPort` on `ligolo_proxy_start` was read but never declared**, so the
+  unknown-argument check rejected every call that passed it.
+- **No second proxy over one that already answers.** If the planned API port
+  was served by a proxy this server did not start, `ligolo_proxy_start` spawned
+  another one that could not bind, got its readiness "pong" from the other
+  process, and recorded the doomed child's pid as a managed instance. It now
+  reports the running proxy (`managed: false`, nothing spawned), and refuses
+  with a clear message when the port answers with an HTTP error.
+- **A recycled pid is no longer treated as our proxy.** A manifest entry whose
+  pid had been reused by an unrelated process counted as live, and
+  `ligolo_proxy_stop` would SIGTERM that process. On Linux the entry must match
+  the proxy's `-config <path>` in `/proc/<pid>/cmdline`.
+- **`LIGOLO_API` defaults to `LIGOLO_API_LISTEN`.** Setting only the listen
+  address started the proxy there while status and unmanaged calls probed :8080.
+- **A TUN device left by an earlier proxy gets an actionable error.** With
+  `CAP_NET_ADMIN`, kernel TUNs outlive the proxy, and a fresh config then failed
+  with `TUNSETIFF failed … device or resource busy`. The error now names the
+  leftover device and how to remove it. Seen against proxy 0.9.1.
+
 ### Changed
 
 - `ligolo_listener_delete` on a listener that is already gone returns

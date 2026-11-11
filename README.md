@@ -114,7 +114,7 @@ npm run build
 |---|---|---|
 | `LIGOLO_NG_DIR` | — | directory holding `proxy` / `agent` (`…/linux/proxy` also probed) |
 | `LIGOLO_PROXY_BIN` | — | explicit path to the proxy binary (wins over `LIGOLO_NG_DIR`) |
-| `LIGOLO_API` | `http://127.0.0.1:8080` | proxy REST API base URL |
+| `LIGOLO_API` | derived from `LIGOLO_API_LISTEN` (`http://127.0.0.1:8080`) | proxy REST API base URL |
 | `LIGOLO_USER` | `ligolo` | API user (must match `web.users` in the proxy config) |
 | `LIGOLO_PASSWORD` | — | API password; if unset, `ligolo_proxy_start` generates one |
 | `LIGOLO_TOKEN` | — | pre-minted JWT instead of user/password |
@@ -414,7 +414,7 @@ Mutating (10, hidden with `LIGOLO_MCP_READ_ONLY=1`):
 
 | Tool | Parameters | Gate |
 |---|---|---|
-| `ligolo_proxy_start` | `port?`, `rewriteConfig?` | none — starts the proxy headless with a seeded loopback-API config |
+| `ligolo_proxy_start` | `port?`, `apiPort?`, `rewriteConfig?`, `reuse?` | none — starts the proxy headless with a seeded loopback-API config |
 | `ligolo_proxy_stop` | — | none — SIGTERM via pid file |
 | `ligolo_interface_create` | `name?` | none (local TUN only) |
 | `ligolo_tunnel_start` | `agentId`, `target`, `tun?`, `confirmed?` | **lateral checkpoint**; registers the interface first if missing |
@@ -528,7 +528,7 @@ Logs: `<config dir>/ligolo-proxy.log` (proxy stdout/stderr) and
 ```bash
 npm run build     # tsc -> dist/
 npm run dev       # tsc --watch
-npm test          # build, then 51 tests over real MCP stdio against a stub API
+npm test          # build, then 57 tests over real MCP stdio against a stub API
 ```
 
 The suite needs no ligolo binary, no root and no network: it spawns

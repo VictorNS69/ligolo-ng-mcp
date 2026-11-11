@@ -178,8 +178,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, cwd: string = p
   const credsPath = join(dirname(proxyConfig), ".ligolo-mcp-credentials");
   const creds = readCreds(credsPath);
   const assessment = resolveAssessment(root, envStr(env, "LIGOLO_ASSESSMENT", ""));
+  const apiListen = envStr(env, "LIGOLO_API_LISTEN", "127.0.0.1:8080");
+  // Without an explicit LIGOLO_API, talk to where the proxy is told to listen.
+  // A fixed :8080 default meant LIGOLO_API_LISTEN=127.0.0.1:9090 alone started
+  // the proxy on 9090 while status and every unmanaged call probed 8080.
+  const listenHostPart = listenHost(apiListen);
+  const reachableHost = /^(0\.0\.0\.0|::|)$/.test(listenHostPart) ? "127.0.0.1" : listenHostPart;
+  const defaultApi = `http://${reachableHost.includes(":") ? `[${reachableHost}]` : reachableHost}:${apiListen.slice(apiListen.lastIndexOf(":") + 1)}`;
   return {
-    apiUrl: envStr(env, "LIGOLO_API", "http://127.0.0.1:8080").replace(/\/+$/, ""),
+    apiUrl: envStr(env, "LIGOLO_API", defaultApi).replace(/\/+$/, ""),
     user: envStr(env, "LIGOLO_USER", creds.user ?? "ligolo"),
     password: envStr(env, "LIGOLO_PASSWORD", creds.password ?? ""),
     token: envStr(env, "LIGOLO_TOKEN", ""),
@@ -189,7 +196,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, cwd: string = p
     proxyBin: resolveProxyBin(env),
     proxyConfig,
     proxyAddr: envStr(env, "LIGOLO_PROXY_ADDR", "0.0.0.0:11601"),
-    apiListen: envStr(env, "LIGOLO_API_LISTEN", "127.0.0.1:8080"),
+    apiListen,
     // An expired or invalid marker names an assessment, but it does not
     // *authorize* one: the filesystem guard treats it as development mode, and
     // so must the gate. Keep the name out of `assessment` so a stale marker
@@ -560,8 +567,27 @@ export class LigoloApi {
     return this.call("GET", "/api/v1/listeners");
   }
 
-  createInterface(name: string): Promise<{ message: string }> {
-    return this.call("POST", "/api/v1/interfaces", { Interface: name });
+  /**
+   * With CAP_NET_ADMIN the proxy creates a real kernel TUN, and that device
+   * outlives the proxy. A later proxy with a fresh config then fails with
+   * "Tuntap IOCTL TUNSETIFF failed [0], errno device or resource busy", which
+   * names neither the cause nor the fix. (Seen against proxy 0.9.1.)
+   */
+  async createInterface(name: string): Promise<{ message: string }> {
+    try {
+      return await this.call("POST", "/api/v1/interfaces", { Interface: name });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/TUNSETIFF/i.test(msg) && /busy/i.test(msg)) {
+        throw new Error(
+          `${msg} — a TUN device named ${name} already exists on this host, usually left by an earlier proxy ` +
+            `(kernel TUNs outlive the process). Check with \`ip -d link show ${name}\`; remove it with ` +
+            `\`sudo ip link delete ${name}\`, or pick another interface name. Teardown with deleteInterface: true ` +
+            "removes it while the proxy that knows it is still running.",
+        );
+      }
+      throw err;
+    }
   }
 
   deleteInterface(name: string): Promise<{ message: string }> {

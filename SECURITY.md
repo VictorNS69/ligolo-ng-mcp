@@ -9,12 +9,12 @@ Nothing here grants authorization, and the gate exists precisely because
 "reachable" is not "in scope":
 
 - `ligolo_tunnel_start`, `ligolo_route_add` and `ligolo_listener_add` refuse to
-  run unless `scope_check.py` clears a lateral-movement checkpoint for the named
-  target.
+  run unless the named target is inside `LIGOLO_SCOPE` **and** the call carries
+  `confirmed: true` (exit 3 / 4 / 5). `ligolo_route_add` additionally requires
+  the whole routed network to fit inside a single scope entry.
 - With no authorization source at all, mutating tools fail closed rather than
-  guessing; `LIGOLO_SCOPE` provides the same guarantee without a framework
-  (target-in-list plus explicit confirmation), and framework mode additionally
-  requires the assessment's `ligolo.mcp: true` opt-in.
+  guessing; there is no mode in which the gate can be switched off, and no
+  external file is consulted.
 - `LIGOLO_MCP_READ_ONLY=1` exposes only the 9 read-only tools.
 
 ## Threat model
@@ -56,5 +56,5 @@ Tested against ligolo-ng proxy 0.9.1 and 0.9.2.
 Open a private security advisory on this repository, or email the maintainer
 (Víctor Nieves) at the address in the git commits. Please do not open a public
 issue for a vulnerability. Include the version, the tool call, and the smallest
-reproduction you can manage; a `scope_check` bypass or an ungated mutating path
+reproduction you can manage; a `LIGOLO_SCOPE` bypass or an ungated mutating path
 is the highest-severity class here.

@@ -40,12 +40,12 @@ started from.
 ### Removed (breaking)
 
 - **Framework mode is gone; `LIGOLO_SCOPE` is the only authorization.** The
-  server no longer looks for an external `scripts/common/scope_check.py`,
-  reads an assessment's `scope.yaml` / `ligolo.mcp` flag or active-assessment
-  marker, or appends to an external `commands.log`. `LIGOLO_ASSESSMENT` and
-  `LIGOLO_BITORIA_ROOT` are ignored. Migration: set `LIGOLO_SCOPE` to the
-  hosts/CIDRs you are authorized to reach; the gate (target in scope +
-  `confirmed: true`, exit 3/4/5) is unchanged.
+  server no longer looks for an external scope-check script, reads another
+  tool's assessment file, per-assessment flag or active-assessment marker, or
+  appends to an external command log. The two old framework environment
+  variables are ignored. Migration: set `LIGOLO_SCOPE` to the hosts/CIDRs you
+  are authorized to reach; the gate (target in scope + `confirmed: true`,
+  exit 3/4/5) is unchanged.
 - Proxy logs always go to `<workspace>/ligolo[<n>].log` (previously the
   assessment's state tree when one was active).
 - Tool texts no longer refer to `state/decisions.md`, `state/hosts.md` or
@@ -145,7 +145,7 @@ started from.
 ## 1.4.0 — 2026-11-08
 
 Field report from a five-host, four-hop pivot driven entirely through this
-server (`assessments/2026_11_08_bigpivoting_dockerlabs` in BITORIA-Hermes).
+server (a docker double-pivot lab).
 Every item below is a failure the run actually hit.
 
 ### Fixed
@@ -217,8 +217,8 @@ Every item below is a failure the run actually hit.
 - **Standalone mode.** `LIGOLO_SCOPE` (comma-separated hosts/CIDRs) authorizes
   reachability-changing calls without any framework: target must be inside the
   list and the call must pass `confirmed: true`. Read-only tools need nothing.
-  Previously every mutating tool refused unless a BITORIA checkout and an
-  assessment were present, which made the server unusable outside that framework.
+  Previously every mutating tool refused unless an external framework checkout
+  and an assessment were present, which made the server unusable outside it.
 - The gate now has two explicit modes with stable exit codes: 3 = target outside
   `LIGOLO_SCOPE`, 5 = checkpoint not confirmed, 4 = no authorization source /
   assessment did not opt in.
@@ -282,7 +282,7 @@ the internals are rewritten.
 
 - Reachability-changing tools (`ligolo_tunnel_start`, `ligolo_route_add`,
   `ligolo_listener_add`) run
-  `scripts/common/scope_check.py <target> --assessment <A> --technique lateral --checkpoint`
+  an external scope-check script plus the per-assessment opt-in
   in-process before any HTTP request, and refuse with
   `{"error":"checkpoint-denied","action_taken":false}` when it denies.
 - `log_command.sh` audit trail for every call (tool, arguments, target).
@@ -293,9 +293,8 @@ the internals are rewritten.
   password when `LIGOLO_PASSWORD` is unset, and writes it to
   `.ligolo-mcp-credentials` (mode 0600).
 - `LIGOLO_MCP_READ_ONLY=1`: registers only the 9 read-only tools.
-- Assessment resolution via `state/assessment-scope.json`, mirroring the
-  framework's own marker and 12h TTL; expired/invalid markers are treated as no
-  assessment.
+- Assessment resolution for the (now removed) framework mode, with the same
+  marker and 12h TTL; expired/invalid markers were treated as no assessment.
 - Real agent interface/address data (`GET /api/v1/agents`), replacing the
   `ifconfig` console scrape.
 - `port` parameter on `ligolo_proxy_start` to override the agent-facing port for

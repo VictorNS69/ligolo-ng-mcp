@@ -20,6 +20,13 @@ function listen(server) {
   return new Promise((res) => server.listen(0, "127.0.0.1", () => res(server.address().port)));
 }
 
+// Whether this host has IPv6 loopback at all; the IPv6 cases skip without it.
+const ipv6 = await new Promise((res) => {
+  const probe = createServer();
+  probe.once("error", () => res(false));
+  probe.listen(0, "::1", () => probe.close(() => res(true)));
+});
+
 describe("portFree", () => {
   it("is false for a port another process holds", async () => {
     const server = createServer();
@@ -48,6 +55,26 @@ describe("portFree", () => {
     const port = await listen(server);
     try {
       assert.equal(await portFree(`127.0.0.1:${port}`), false);
+    } finally {
+      await new Promise((res) => server.close(res));
+    }
+  });
+
+  // A bracketed IPv6 literal (`[::1]:8080`, what `apiUrl` carries) must be
+  // bind-tested as `::1`; passed through with brackets, the bind failed and a
+  // free port was reported as held.
+  it("is true for a free bracketed IPv6 address", { skip: !ipv6 && "no ::1 on this host" }, async () => {
+    const server = createServer();
+    const port = await new Promise((res) => server.listen(0, "::1", () => res(server.address().port)));
+    await new Promise((res) => server.close(res));
+    assert.equal(await portFree(`[::1]:${port}`), true);
+  });
+
+  it("is false for a held bracketed IPv6 address", { skip: !ipv6 && "no ::1 on this host" }, async () => {
+    const server = createServer();
+    const port = await new Promise((res) => server.listen(0, "::1", () => res(server.address().port)));
+    try {
+      assert.equal(await portFree(`[::1]:${port}`), false);
     } finally {
       await new Promise((res) => server.close(res));
     }

@@ -224,7 +224,9 @@ function portOf(addr: string): number {
  * before spawning instead.
  */
 export async function portFree(addr: string): Promise<boolean> {
-  const host = addr.includes(":") ? addr.slice(0, addr.lastIndexOf(":")) : "127.0.0.1";
+  // `listenHost` strips the brackets of an IPv6 literal: `net.listen` wants
+  // `::1`, not `[::1]`, and would otherwise fail and report a free port as held.
+  const host = addr.includes(":") ? listenHost(addr) : "127.0.0.1";
   const port = portOf(addr);
   if (port === 0) return true;
   return await new Promise<boolean>((resolvePort) => {

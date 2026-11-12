@@ -252,7 +252,7 @@ async function startServer({
     child.kill("SIGKILL");
     await new Promise((r) => server.close(r));
   };
-  return { client, state, tools, cert, cleanup, workdir };
+  return { client, state, tools, cert, cleanup, workdir, env: { LIGOLO_API: `http://127.0.0.1:${port}` } };
 }
 
 /**
@@ -570,7 +570,12 @@ describe("proxy lifecycle", () => {
       assert.equal(payload.running, true);
       assert.equal(payload.managed, false, "a proxy this server did not spawn is reported as external");
       assert.match(payload.compatibility, /ligolo-ng proxy 0\.9\.x \(tested 0\.9\.1, 0\.9\.2\)/);
-      assert.equal(payload.apiUrl, process.env.LIGOLO_API ?? payload.apiUrl);
+      // Compare against what the harness actually pointed the server at, not
+      // this process's environment: the assertion used to read
+      // `process.env.LIGOLO_API ?? payload.apiUrl`, which is a tautology when
+      // the variable is unset and a mismatch when the harness picked a random
+      // port (it failed on a clean checkout, 2026-11-12).
+      assert.equal(payload.apiUrl, h.env.LIGOLO_API ?? payload.apiUrl);
       assert.ok(existsSync(dirname(payload.configPath)));
     } finally {
       await h.cleanup();
@@ -1037,19 +1042,25 @@ describe("observer WebUI", () => {
     }
   });
 
-  it("will not silently reuse an existing config that has the UI off", async () => {
+  it("merges the UI keys into an existing config instead of demanding a rewrite", async () => {
     const root = mkdtempSync(join(tmpdir(), "ligolo-ui3-"));
     const off = await mkCfg(root, { LIGOLO_WEBUI: "" });
     const { seedConfig, planInstance } = await import("../dist/proxy.js");
     seedConfig(off, planInstance(off, {}), false);
     const on = await mkCfg(root);
-    assert.throws(
-      () => seedConfig(on, planInstance(on, {}), false),
-      /web\.enableui off and has no web\.users entry for operator.*rewriteConfig: true/,
-    );
+    // Turning the WebUI on used to throw ("has web.enableui off and has no
+    // web.users entry ... rewriteConfig: true"), and the only cure regenerated
+    // the file — dropping routes an existing pivot holds. It now merges.
+    const merged = seedConfig(on, planInstance(on, {}), false);
+    assert.equal(merged.created, false, "no regeneration");
+    assert.ok(merged.backup && existsSync(merged.backup), "original kept as .bak");
+    const text = readFileSync(merged.path, "utf8");
+    assert.match(text, /enableui: true/);
+    assert.match(text, new RegExp(`^\\s+${on.webUiUser}:`, "m"), "observer entry added");
+    assert.match(text, /users:/, "api user still there");
+    // And a rewrite still works when the operator asks for one.
     const rewritten = seedConfig(on, planInstance(on, {}), true);
     assert.equal(rewritten.created, true);
-    assert.ok(rewritten.backup && existsSync(rewritten.backup), "original kept as .bak");
     assert.match(readFileSync(rewritten.path, "utf8"), /enableui: true/);
   });
 

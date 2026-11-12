@@ -24,6 +24,7 @@ import net from "node:net";
 import { dirname, join } from "node:path";
 
 import { Ledger } from "./ledger.js";
+import { mergeWebUi } from "./webui.js";
 import { Config, isLoopback, LigoloApi, listenHost, readCreds } from "./ligolo.js";
 
 /** One running (or configured) proxy instance. */
@@ -400,31 +401,27 @@ export function seedConfig(
 
   if (existsSync(path) && !rewrite) {
     const existing = readFileSync(path, "utf8");
-    if (!/^\s*enabled:\s*true/m.test(existing) || !/^\s*users:/m.test(existing)) {
-      throw new Error(
-        `${path} exists but does not enable the web/API surface or define web.users. ` +
-          "Re-call ligolo_proxy_start with rewriteConfig: true (the original is backed up as .bak), " +
-          "or add `web.enabled: true` + `web.users` to it yourself.",
-      );
-    }
-    if (cfg.webUi) {
-      const uiOn = /^\s*enableui:\s*true\b/m.test(existing);
-      const userOn = new RegExp(`^\\s+${escapeRe(cfg.webUiUser)}:`, "m").test(existing);
-      if (!uiOn || !userOn) {
-        throw new Error(
-          `LIGOLO_WEBUI=1, but ${path} ` +
-            [!uiOn ? "has web.enableui off" : "", !userOn ? `has no web.users entry for ${cfg.webUiUser}` : ""]
-              .filter((v) => v !== "")
-              .join(" and ") +
-            ". Re-call ligolo_proxy_start with rewriteConfig: true (the original is backed up as .bak; " +
-            "routes and interfaces stored in it are dropped), or edit it yourself.",
-        );
-      }
+    // Merge the keys we need instead of demanding a full rewrite: regenerating
+    // the file to turn the WebUI on dropped every interface and route stored in
+    // it (measured 2026-11-12, a live pivot with seven routes).
+    const merged = mergeWebUi(existing, {
+      apiUser: cfg.user,
+      password,
+      webUi: cfg.webUi,
+      webUiUser: cfg.webUiUser,
+      webUiPassword: cfg.webUiPassword,
+      apiUrl: spec.apiUrl,
+    });
+    let backup: string | null = null;
+    if (merged !== null) {
+      backup = `${path}.bak`;
+      writeFileSync(backup, existing, { mode: 0o600 });
+      writeFileSync(path, merged, { mode: 0o600 });
     }
     if (!existsSync(spec.credsPath) && existingCreds.password === undefined) {
       writeFileSync(spec.credsPath, JSON.stringify({ user: cfg.user, password }, null, 2), { mode: 0o600 });
     }
-    return { created: false, backup: null, path, password };
+    return { created: false, backup, path, password };
   }
 
   let backup: string | null = null;

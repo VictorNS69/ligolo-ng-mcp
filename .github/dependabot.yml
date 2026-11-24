@@ -5,6 +5,9 @@
 # transitively, so an SDK bump alone clears most advisories. One grouped PR per
 # ecosystem is reviewable; seven transitive PRs (the state of the repository this
 # fork came from) is how a security update sits unmerged for months.
+#
+# Patch/minor bumps merge themselves once the test matrix is green
+# (.github/workflows/test.yml, job dependabot-merge); majors wait for a human.
 version: 2
 updates:
   - package-ecosystem: npm
@@ -14,13 +17,19 @@ updates:
       day: monday
     open-pull-requests-limit: 3
     groups:
+      # Both groups claim minor and patch only, so a grouped PR is always
+      # auto-mergeable (test.yml's dependabot-merge job). A major in a group
+      # would make the whole group report semver-major and hold back the
+      # minor/patch bumps riding with it; majors arrive as their own PRs.
       mcp-sdk:
         patterns:
           - "@modelcontextprotocol/sdk"
+        update-types: [minor, patch]
       tooling:
         patterns:
           - "typescript"
           - "@types/*"
+        update-types: [minor, patch]
     commit-message:
       prefix: chore(deps)
 

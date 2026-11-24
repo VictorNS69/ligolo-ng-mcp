@@ -32,3 +32,49 @@ jobs:
         # dev-time package must not block a fix. Keep it visible instead.
         continue-on-error: true
         run: npm audit --omit=dev
+
+  # Dependabot merges its own patch/minor bumps once every Node leg above is
+  # green. A job in this workflow rather than `gh pr merge --auto`: `needs:`
+  # makes the test result the gate by construction, so it holds without branch
+  # protection or the repository's "Allow auto-merge" setting -- `--auto` waits
+  # only for *required* checks, and with none configured it would merge before
+  # the tests ran.
+  #
+  # What stays human: semver-major bumps (TypeScript 5 -> 7, actions v5 -> v7).
+  # A major is a migration, not a bump, and its PR is left open.
+  #
+  # Safety: `pull_request`, never `pull_request_target`, and the job never
+  # checks out or runs PR code -- it reads the PR body through the API and
+  # calls the merge. Both conditions pin it to Dependabot's own PRs: `actor`
+  # alone can be met by anything triggering under that name.
+  dependabot-merge:
+    needs: test
+    if: |
+      github.event_name == 'pull_request' &&
+      github.actor == 'dependabot[bot]' &&
+      github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Dependabot-triggered runs get a read-only token unless the job asks;
+    # this job asks for exactly the two scopes a merge needs.
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      # Update type (semver-patch / -minor / -major) from the PR Dependabot
+      # wrote; for a group it is the highest bump in the group. Pinned by SHA:
+      # this step runs with a write token. Dependabot keeps the pin current.
+      - name: Read Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge patch and minor bumps
+        if: |
+          steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
+          steps.metadata.outputs.update-type == 'version-update:semver-minor'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge --squash "$PR_URL"

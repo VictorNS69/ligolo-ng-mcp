@@ -508,6 +508,13 @@ leaves the process — the HTTP bodies sent to the proxy, that a denied call sen
 **nothing**, teardown ordering, fingerprint equality with the certificate, the
 0600 credential file and credential precedence.
 
+Dependabot PRs need no review when they are patch or minor bumps: the
+`dependabot-merge` job in `.github/workflows/test.yml` merges them once the test
+matrix (Node 20/22/24) is green, and a red leg leaves the PR open. Semver-major
+bumps are never merged automatically — a major is a migration — so they wait for
+a human. The groups in `.github/dependabot.yml` claim minor and patch only, so a
+major always arrives as its own PR instead of holding a group back.
+
 Source layout: `src/index.ts` (MCP surface + handlers), `src/ligolo.ts` (API
 client, checkpoint gate, fingerprint), `src/proxy.ts` (proxy lifecycle, config
 seeding, port override), `src/ledger.ts` (what the MCP created, for `origin`).

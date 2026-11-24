@@ -4,6 +4,15 @@ Fork of [`schwarztim/sec-ligolo-ng-mcp`](https://github.com/schwarztim/sec-ligol
 (MIT). Versions below are this fork's; `1.0.0` is the upstream initial release it
 started from.
 
+## Unreleased
+
+### CI
+
+- Dependabot patch/minor bumps merge themselves once the Node 20/22/24 test
+  matrix passes (`dependabot-merge` job in `test.yml`, gated by `needs: test`).
+  Majors stay open for review, and the `mcp-sdk` / `tooling` groups now claim
+  minor and patch only, so a major no longer holds a grouped PR back.
+
 ## 3.0.0 — 2026-11-11
 
 ### Security (breaking)
